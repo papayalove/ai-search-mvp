@@ -1,2 +1,13 @@
-﻿# importer config
-
+# 导入工具与 API 共用 configs/api.yaml（或通过 -config / 环境变量 API_CONFIG 指定）。
+#
+# 部署前请确认：
+#   1. milvus：address / username / db_name；密码用环境变量 MILVUS_PASSWORD（或写入本地副本勿提交 git）
+#   2. embedding.enabled: true，并填写 endpoint、model、expected_dim（与 milvus.vector_dim 一致）
+#
+# 运行示例：
+#   set MILVUS_PASSWORD=你的密码
+#   go run ./cmd/importer -config configs/api.yaml -input chunks.ndjson
+# 若 NDJSON 每行是「长文档」而非已切好段落，可加 -chunk，参数见 configs/api.yaml 中 ingest.*
+#
+# NDJSON 每行示例：
+#   {"chunk_id":"doc-1#0","text":"正文片段","source_type":"pdf","lang":"zh","ts":1710000000000}

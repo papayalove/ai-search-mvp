@@ -1,2 +1,60 @@
-﻿# api config
+# API 服务配置（路径可用环境变量 API_CONFIG 覆盖，默认 configs/api.yaml）
 
+http:
+  addr: ":8080"
+
+# pymilvus 示例: MilvusClient(uri="tcp://10.12.105.139:30005", user="...", password="...", db_name="mineru_core")
+# 此处 address 可写 tcp://host:port 或 host:port；密码可写在项目根目录 .env 的 MILVUS_PASSWORD（见 .env.example），勿提交 .env。
+milvus:
+  enabled: true
+  address: "tcp://10.12.105.139:30005"
+  username: "xuchao"
+  password: ""
+  api_key: ""
+  enable_tls: false
+  db_name: "mineru_core"
+  collection: "ai_search_test"
+  vector_dim: 1024
+  max_chunk_id_len: 512
+  max_doc_id_len: 512
+  shard_num: 2
+  insert_batch: 512
+  # 向量索引：省略或 autoindex 为 AUTOINDEX；hnsw 为 HNSW（COSINE）。切换类型需删原 embedding 字段索引或重建 collection。
+  index_type: hnsw
+  hnsw_m: 16
+  hnsw_ef_construction: 200
+  hnsw_ef: 64
+
+# Elasticsearch 实体倒排（entity_postings_v1）；密码请写在项目根 .env 的 ES_PASSWORD（勿提交）。
+# 环境变量可覆盖：ES_URL 或 ES_ADDRESSES、ES_USERNAME、ES_PASSWORD、ES_INDEX。
+elasticsearch:
+  enabled: true
+  address: "http://10.12.111.133:19200"
+  username: "elastic"
+  password: ""
+  index: "entity_postings_v1"
+  request_timeout_seconds: 30
+
+# importer -chunk：递归字符分块；chunk_size 为单块最大长度（rune 数，与 Python len 一致）
+ingest:
+  chunk_size: 728
+  chunk_overlap: 50
+  keep_separator: true
+
+# 嵌入：仅支持 HTTP（OpenAI 风格 POST /v1/embeddings）。两种方式由根目录 .env 的 EMBEDDING_SOURCE 切换：
+#   remote — 使用 EMBEDDING_API_BASE_URL（或下方 endpoint）；self_hosted — 使用 EMBEDDING_LOCAL_HTTP_HOST/PORT 拼本机 python/embedding-service。
+# kwargs / extra_request_fields 会并入请求 JSON。
+# .env：EMBEDDING_SOURCE、EMBEDDING_API_*、EMBEDDING_LOCAL_HTTP_*、EMBEDDING_ENDPOINT（最高优先级完整 URL）
+embedding:
+  enabled: true
+  backend: http
+  endpoint: "http://34.13.73.248:3888/v1/embeddings"
+  api_key: ""
+  model: "BAAI/bge-m3"
+  extra_request_fields:
+    encoding_format: "float"
+  timeout_seconds: 120
+  max_batch: 32
+  expected_dim: 1024
+  request_format: openai
+  response_format: openai_data

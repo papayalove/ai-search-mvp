@@ -1,0 +1,12 @@
+# CPU 环境可先用官方 CPU 轮安装 torch，再装其余依赖，例如：
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# Qwen3 / model_type qwen3 的 checkpoint 需要较新 transformers（见 Qwen 官方 quickstart）
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+transformers>=4.51.0
+# 仅当 EMBEDDING_LOADER=sentence_transformers 时需要
+sentence-transformers>=3.0.0
+# transformers 4.5x + sentence-transformers 3.x 在导入链上要求 torch>=2.1；2.0.x 会出现 LRScheduler 等 NameError
+torch>=2.1.0

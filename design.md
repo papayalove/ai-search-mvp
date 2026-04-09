@@ -1,4 +1,4 @@
-﻿# Agent-Oriented Semantic Search MVP Design
+# Agent-Oriented Semantic Search MVP Design
 
 ## 0. 文档导航
 
@@ -34,13 +34,16 @@ MVP 范围：
 ## 3. 总体架构
 
 核心组件：
-- API Service（Go）：对外搜索接口与查询编排。
+- API Service（Go）：对外搜索接口与查询编排；在配置 Redis 入库队列时提供异步 Admin 入库接口。
 - Query Rewrite Service（外部 API）：将原 query 重写为 5 路。
 - Entity Inverted Index（ES）：实体/术语到 chunk_id 的倒排映射。
 - Vector Store（Milvus）：chunk 向量检索。
 - Metadata Store（关系型或 KV）：chunk 文本与来源元信息。
 - Reranker（外部 API）：对候选集合统一精排。
-- Ingestion Pipeline（Go 离线任务）：解析、分块、实体抽取、索引写入。
+- **Redis 入库队列**：multipart 与远程 S3 引用先入队，由 Worker 消费（见 §4.2.1）。
+- **S3（只读）**：远程入库任务中按对象键流式拉取 NDJSON 正文（凭证与 endpoint 见 `.env`）。
+- **嵌入**：Go 进程内**仅**通过 **OpenAI 兼容 HTTP** 调嵌入；可选**远端 API**或**自建 Python 服务**（`python/embedding-service`），由 **`EMBEDDING_SOURCE`** 切换（见 §6.3）。
+- Ingestion Pipeline（Go）：`cmd/importer` Worker 或 `-input` 单次文件，经 Runner 写 Milvus + ES。
 
 ## 4. 数据模型与索引设计
 
@@ -50,28 +53,40 @@ MVP 范围：
 - 约束：ES、Milvus、Metadata Store 均使用同一 `chunk_id`。
 
 ### 4.2 ES（实体倒排）
-索引建议：`entity_postings_v1`
+索引建议：`entity_postings_v1`（schema 变更时请使用新索引名或 reindex，与代码中 `EnsureIndex` 行为一致）
 
-关键字段：
-- `entity_key`（keyword）：归一化实体/术语。
+关键字段（与实现 [internal/storage/es](internal/storage/es) 对齐）：
+- `entity_keys`（keyword 数组）：归一化实体/术语，每 chunk 一条 posting 文档。
 - `chunk_id`（keyword）
 - `doc_id`（keyword）
 - `source_type`（keyword: web/pdf）
 - `lang`（keyword）
-- `ts`（date）
+- `job_id`、`task_id`（keyword）：入库批次与业务任务 ID。
+- `extra_info`（object，dynamic）：行级扩展 JSON。
+- `created_time`、`update_time`（date）：首次写入与每次索引更新时间。
+
+**实体召回查询**：`SearchByEntityKeys` 使用 `bool` + `should`（每查询键一条 `term` 打在 `entity_keys` 上），`minimum_should_match: 1`；排序链为 `_score` 降序、`update_time` 降序、`chunk_id` 升序。
 
 说明：
 - 只承担实体到 chunk 的高效候选召回，不依赖全文 BM25 主召回。
 
+### 4.2.1 入库队列（Redis + Worker）
+
+- `POST /v1/admin/ingest`（multipart）与 `POST /v1/admin/ingest/remote`（JSON + S3 引用）均**先入 Redis 队列**，返回 **202** 与 `job_id`。
+- multipart 文件正文写入 Redis，**TTL 默认 3h**（测试向）；远程 job 相关元数据/状态键 **TTL 默认 24h**。
+- **Worker**：`cmd/importer` 在无 `-input` 等「单次文件」参数时消费队列，调用现有 **Runner** 同时写 **Milvus 与 ES**（ES 未启用则跳过）；远程路径对 S3 对象 **流式 GetObject** 后按 NDJSON 行处理。
+- 配置以环境变量为主，见仓库根目录 `.env.example`（`INGEST_*`、`S3_ENDPOINT`、`AWS_*`）。
+
 ### 4.3 Milvus（向量索引）
-Collection 建议：`chunk_vectors_v1`
+Collection 建议：`chunk_vectors_v1`（列变更需新建 collection 或删建）
 
 字段：
 - `chunk_id`（主键）
 - `embedding`（vector<float>）
-- `source_type`（scalar）
-- `lang`（scalar）
-- `ts`（scalar）
+- `doc_id`、`source_type`、`lang`（VarChar）
+- `job_id`、`task_id`（VarChar）
+- `extra_info`（VarChar，JSON 字符串）
+- `created_time`、`updated_time`（Int64，Unix 毫秒 UTC）
 
 ### 4.4 Metadata Store
 建议表：`chunk_metadata`
@@ -138,20 +153,58 @@ Collection 建议：`chunk_vectors_v1`
   - 每路召回数量
   - 合并后候选数量
 
+### 6.2 Admin 异步入库 API
+
+与实现 [internal/app/http.go](internal/app/http.go)、[internal/api/handler](internal/api/handler) 对齐：
+
+| 接口 | 行为 | 前提 |
+|------|------|------|
+| `POST /v1/admin/ingest` | multipart 文件正文写入 Redis（TTL 默认 3h），任务入队，返回 **202** + `job_id` | `REDIS_INGEST_ENABLED=true` 且已配置 `REDIS_INGEST_URL` 或 `REDIS_INGEST_HOST`（可配 `REDIS_INGEST_PASSWORD` 等）并成功连接 Redis；否则不注册该路由 |
+| `POST /v1/admin/ingest/remote` | JSON 携带 S3 引用等并入队，**202** + `job_id` | 同上 |
+
+Worker：`cmd/importer` **无** `-input` 时常驻消费队列，调用 **Runner** 同时写 **Milvus + ES**（与 `configs/api.yaml` 开关一致）；**带** `-input` 时仍为单次 NDJSON 文件导入（不经过队列）。细节见 §4.2.1。
+
+### 6.3 嵌入 HTTP 客户端（Go）与 `EMBEDDING_SOURCE`
+
+实现：[internal/config/embedding.go](internal/config/embedding.go) → [internal/model/embedding/http_embedder.go](internal/model/embedding/http_embedder.go)。`configs/api.yaml` 中 **`embedding.backend` 仅支持 `http`**；进程内 **ONNX/hugot 本地嵌入已移除**，统一走 HTTP。
+
+**两种来源**（根目录 `.env` 的 **`EMBEDDING_SOURCE`**）：
+
+| 取值 | 嵌入 URL 推导 | API Key（`Authorization: Bearer`） |
+|------|----------------|-----------------------------------|
+| `remote`（及 `api`、`cloud`） | `EMBEDDING_ENDPOINT`（完整 URL）优先；否则 `EMBEDDING_API_BASE_URL` + `/v1/embeddings`；再否则 yaml `embedding.endpoint` | **`EMBEDDING_API_KEY`**（覆盖 yaml `api_key`） |
+| `self_hosted`（及 `local_service`、`python`） | `http://EMBEDDING_LOCAL_HTTP_HOST:EMBEDDING_LOCAL_HTTP_PORT/v1/embeddings`（`0.0.0.0` 在客户端侧会规范为 `127.0.0.1`） | **仅** **`EMBEDDING_LOCAL_API_KEY`**（为空则不带 Bearer；**不使用** `EMBEDDING_API_KEY`，避免与远程混用） |
+
+请求体中的 `model` 等仍由 yaml / `EMBEDDING_API_MODEL` 等配置，须与对端服务约定一致。
+
+**自建 Python 嵌入服务**（可选）：[python/embedding-service](python/embedding-service) 提供与上述相同的 OpenAI 风格 `POST /v1/embeddings`；进程内鉴权见该目录 `DESIGN.md`（`EMBEDDING_SERVICE_API_KEY` / `EMBEDDING_LOCAL_API_KEY`，**勿**与 Go 的 `EMBEDDING_API_KEY` 混读）。默认模型加载策略为 **`EMBEDDING_LOADER=huggingface`**（transformers `AutoModel` + mean pool），可选 `sentence_transformers`。
+
+**冒烟脚本**：仓库根目录 `demo_call_local.py` 按 **`EMBEDDING_SOURCE`** 调用远程或本地嵌入 URL，并选用对应 Key（未设置 `EMBEDDING_SOURCE` 时脚本默认按 `self_hosted` 测本机）。
+
 ## 7. 数据导入与更新（Ingestion）
 
-离线日更流程：
-1. 读取源数据（web/pdf）。
-2. 文本抽取与清洗。
-3. chunk 切分（含 overlap）。
-4. 实体/术语抽取与归一化。
-5. embedding 生成（外部 API）。
-6. 同步写入 ES、Milvus、Metadata Store。
+### 7.1 线上/测试主路径（Redis 队列 + Worker）
+
+与 §4.2.1、§6.2 一致，流程为：
+
+1. 客户端调用 Admin 入库接口 → 任务入队（multipart 正文或 S3 元数据在 Redis 中 TTL 管理）。
+2. `cmd/importer` Worker 出队 → 解析 NDJSON（远程经 S3 **GetObject** 流式读）→ chunk / 实体等管线。
+3. **嵌入**：通过 **HTTP** 调用配置的嵌入服务（`EMBEDDING_SOURCE` 决定远端或自建），**非**本进程直接加载 PyTorch/ONNX。
+4. Runner **同时写入** Milvus 与 ES（按 yaml 启用项）。
+
+### 7.2 单次文件导入（不经过队列）
+
+`cmd/importer -input <path> ...`：同步读取本地 NDJSON，同样走 Runner 与同一套嵌入 HTTP 配置，适用于离线批跑与小规模试导。
+
+### 7.3 离线日更（概念流程）
+
+与业务「日更」一致的数据准备步骤仍可描述为：源数据 → 抽取清洗 → chunk → 实体归一化 → **经上述队列或 `-input` 写入索引**。不要求 API 与 Worker 同机。
 
 要求：
 - 幂等导入（重复执行不产生不一致）。
 - 失败重试与坏样本隔离。
 - 导入任务输出统计报表（成功数、失败数、耗时）。
+- **Schema 变更**：Milvus / ES 字段调整多为破坏性，需新 collection / 新索引名或删建后全量重导（与实现 `EnsureCollection` / `EnsureIndex` 行为一致）。
 
 ## 8. 数据清空策略
 
@@ -220,32 +273,37 @@ Collection 建议：`chunk_vectors_v1`
 - 分阶段打点：rewrite、ES 召回、Milvus 召回、merge、rerank
 - 指标面板：延迟、召回量、rerank 输入规模、降级触发率
 
-## 11. Go 工程目录
+## 11. 工程目录（Go 与配套）
 
 ```text
-ai-search-v1/
+仓库根/
   cmd/
     api/
-    importer/
+    importer/          # 无 -input：队列 Worker；有 -input：单次导入
     cleaner/
     evaluator/
   internal/
     app/
     api/{handler,dto,middleware}
+    queue/             # Redis 入库任务 broker
     query/{rewrite,entity,recall,rerank,pipeline}
-    ingest/{source,parse,chunk,enrich,indexer}
-    storage/{es,milvus,meta}
+    ingest/{source,parse,chunk,enrich,indexer,pipeline}
+    storage/{es,milvus,meta,s3}   # s3：远程 ingest 只读客户端
     eval/{dataset,runner,metrics,report}
     clean/{plan,execute}
     model/{embedding,rewrite,rerank}
     config/
     observability/
   pkg/{types,util}
+  python/embedding-service/   # 可选：自建 OpenAI 兼容嵌入 HTTP
   configs/
+  demo_call_local.py          # 按 EMBEDDING_SOURCE 测嵌入 HTTP
   deployments/{docker,k8s}
   scripts/
   test/{integration,e2e}
 ```
+
+环境变量约定见根目录 [`.env.example`](./.env.example)（`INGEST_*`、`EMBEDDING_SOURCE`、`EMBEDDING_*`、`S3_*`、`AWS_*` 等）。
 
 ## 12. 里程碑与演进
 
@@ -275,13 +333,24 @@ M3（规模化准备）：
 风险：公开数据集与业务场景偏差
 - 缓解：MVP 后补充业务小样本标注集做校准
 
-## 14. 模型选型（MVP 固定）
+## 14. 模型选型与嵌入部署
 
-为确保评测可复现与实现一致性，MVP 阶段固定使用以下模型：
+### 14.1 评测基线（建议固定）
 
-- Embedding 模型：`Qwen3-Embedding-0.6B`
-- Reranker 模型：`Qwen3-Reranker-0.6B`
+为确保离线评测可复现，建议基线：
+
+- Embedding（语义向量）：`Qwen3-Embedding-0.6B`（或与之对标的统一 checkpoint）
+- Reranker：`Qwen3-Reranker-0.6B`
 
 约束：
 - 在同一轮离线评测和线上 A/B 中，不混用其他 embedding 或 reranker 模型。
-- 若后续替换模型，必须记录新模型版本并与当前基线做对比评测（`Recall@k`, `MRR@10`, `nDCG@10`, `P95`）。
+- 若替换模型，须记录版本并与基线对比（`Recall@k`, `MRR@10`, `nDCG@10`, `P95`）。
+
+### 14.2 生产/开发中的嵌入服务形态
+
+实现上 **向量维** 须与 `configs/api.yaml` 中 `milvus.vector_dim`、`embedding.expected_dim` 一致。
+
+- **远端 OpenAI 兼容 API**：`EMBEDDING_SOURCE=remote`，配置 `EMBEDDING_API_BASE_URL` / `EMBEDDING_ENDPOINT` 与 `EMBEDDING_API_KEY`（§6.3）。
+- **自建 Python 服务**：`EMBEDDING_SOURCE=self_hosted`，与 `python/embedding-service` 联调；支持 Hub ID 或本地 checkpoint 路径、`EMBEDDING_MODEL_KWARGS`（JSON）等，详见该目录 `DESIGN.md` 与 `README.md`。
+
+Reranker 仍为外部 HTTP，与本节嵌入部署独立。
