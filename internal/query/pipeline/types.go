@@ -14,6 +14,9 @@ type SearchInput struct {
 	SearchType string `json:"search_type,omitempty"`
 	// Retrieval 文本检索模式：hybrid | milvus | es。公开搜索默认 hybrid；Admin text 默认 hybrid。
 	Retrieval string `json:"retrieval,omitempty"`
+
+	// OnRewriteQueryLine 非 nil 时：若 Rewriter 支持流式，则每输出完整一行子查询回调（供 SSE rewrite_query）。
+	OnRewriteQueryLine func(query string) error `json:"-"`
 }
 
 // SearchHit is one ranked evidence chunk returned to callers.

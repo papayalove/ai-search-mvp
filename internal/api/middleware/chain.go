@@ -13,7 +13,15 @@ const requestIDKey ctxKey = 1
 
 // RequestIDFromContext returns the request ID stored by RequestID middleware, if any.
 func RequestIDFromContext(r *http.Request) string {
-	v := r.Context().Value(requestIDKey)
+	return RequestIDFromGoContext(r.Context())
+}
+
+// RequestIDFromGoContext reads the same request ID from any context (e.g. passed into recall / embed).
+func RequestIDFromGoContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v := ctx.Value(requestIDKey)
 	if s, ok := v.(string); ok {
 		return s
 	}

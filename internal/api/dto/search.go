@@ -9,6 +9,8 @@ type SearchRequest struct {
 	RequestID    string         `json:"request_id,omitempty"`
 	// Retrieval hybrid（默认）| milvus | es
 	Retrieval string `json:"retrieval,omitempty"`
+	// Stream true 时响应为 text/event-stream：rewrite_query（每行一条）→ rewrite_queries → done。
+	Stream bool `json:"stream,omitempty"`
 }
 
 // SearchResponse is the JSON envelope returned by POST /v1/search.

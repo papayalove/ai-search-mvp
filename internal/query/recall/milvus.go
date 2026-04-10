@@ -3,33 +3,24 @@ package recall
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 
 	"ai-search-v1/internal/model/embedding"
 	"ai-search-v1/internal/storage/milvus"
 )
 
-// RecallMilvusText 嵌入 query 后 Milvus ANN，与 pipeline.queryByText 行为一致。
-func RecallMilvusText(ctx context.Context, repo *milvus.Repository, emb embedding.Embedder, text string, topK int) ([]Hit, error) {
+// RecallMilvusVector 使用已算好的查询向量做 Milvus ANN（供批量嵌入后的多路并行召回）。
+func RecallMilvusVector(ctx context.Context, repo *milvus.Repository, vec []float32, topK int) ([]Hit, error) {
 	if repo == nil {
 		return nil, fmt.Errorf("recall milvus: nil repository")
 	}
-	if emb == nil {
-		return nil, fmt.Errorf("recall milvus: embedder is nil")
+	if len(vec) == 0 {
+		return nil, fmt.Errorf("recall milvus: empty vector")
 	}
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return nil, nil
-	}
-	vecs, err := emb.Embed(ctx, []string{text})
-	if err != nil {
-		return nil, fmt.Errorf("recall milvus embed: %w", err)
-	}
-	if len(vecs) != 1 {
-		return nil, fmt.Errorf("recall milvus: expected 1 query vector, got %d", len(vecs))
-	}
+	log.Printf("search: request_id=%s phase=milvus_search_begin top_k=%d dim=%d", requestIDFromCtx(ctx), topK, len(vec))
 	mat, err := repo.SearchVectors(ctx, milvus.VectorSearchParams{
-		Vectors: [][]float32{vecs[0]},
+		Vectors: [][]float32{vec},
 		TopK:    topK,
 		Expr:    "",
 	})
@@ -57,4 +48,27 @@ func RecallMilvusText(ctx context.Context, repo *milvus.Repository, emb embeddin
 		})
 	}
 	return out, nil
+}
+
+// RecallMilvusText 嵌入 query 后 Milvus ANN，与 pipeline.queryByText 行为一致。
+func RecallMilvusText(ctx context.Context, repo *milvus.Repository, emb embedding.Embedder, text string, topK int) ([]Hit, error) {
+	if repo == nil {
+		return nil, fmt.Errorf("recall milvus: nil repository")
+	}
+	if emb == nil {
+		return nil, fmt.Errorf("recall milvus: embedder is nil")
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, nil
+	}
+	log.Printf("search: request_id=%s phase=embed_begin n_texts=1 (milvus path)", requestIDFromCtx(ctx))
+	vecs, err := emb.Embed(ctx, []string{text})
+	if err != nil {
+		return nil, fmt.Errorf("recall milvus embed: %w", err)
+	}
+	if len(vecs) != 1 {
+		return nil, fmt.Errorf("recall milvus: expected 1 query vector, got %d", len(vecs))
+	}
+	return RecallMilvusVector(ctx, repo, vecs[0], topK)
 }

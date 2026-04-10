@@ -8,7 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"ai-search-v1/internal/model/rewrite"
+	modelrewrite "ai-search-v1/internal/model/rewrite"
+	queryrewrite "ai-search-v1/internal/query/rewrite"
 )
 
 const (
@@ -23,7 +24,7 @@ const (
 //	REWRITE_BASE_URL 默认阿里云 compatible-mode 根 URL
 //	REWRITE_MODEL 默认 qwen-turbo
 //	REWRITE_TIMEOUT_SEC 可选，默认 60
-func LoadRewriterFromEnv() rewrite.Rewriter {
+func LoadRewriterFromEnv() queryrewrite.Rewriter {
 	en := envTruthy(os.Getenv("REWRITE_ENABLED"))
 	if !en {
 		return nil
@@ -63,7 +64,7 @@ func LoadRewriterFromEnv() rewrite.Rewriter {
 		}
 	}
 	log.Printf("rewrite: enabled (base_url=%s model=%s timeout=%ds)", base, model, sec)
-	return &rewrite.ChatClient{
+	client := &modelrewrite.ChatClient{
 		HTTPClient:  &http.Client{Timeout: time.Duration(sec) * time.Second},
 		BaseURL:     base,
 		APIKey:      key,
@@ -71,6 +72,7 @@ func LoadRewriterFromEnv() rewrite.Rewriter {
 		Temperature: temp,
 		MaxTokens:   maxTok,
 	}
+	return queryrewrite.NewLLMRewriter(client)
 }
 
 func envTruthy(s string) bool {

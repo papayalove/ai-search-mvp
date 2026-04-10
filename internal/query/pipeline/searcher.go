@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"ai-search-v1/internal/model/embedding"
-	modelrewrite "ai-search-v1/internal/model/rewrite"
 	"ai-search-v1/internal/query/recall"
+	queryrewrite "ai-search-v1/internal/query/rewrite"
 	"ai-search-v1/internal/storage/es"
 	"ai-search-v1/internal/storage/milvus"
 )
@@ -30,8 +30,8 @@ type MilvusSearcher struct {
 	Repo *milvus.Repository
 	Emb  embedding.Embedder
 	ES   *es.Repository // 可选；用于 hybrid / es 文本检索
-	// Rewriter 非 nil 且启用时：POST /v1/search 先多路改写再并行召回（见 recall.RunTextRetrievalWithOptionalRewrite）。
-	Rewriter modelrewrite.Rewriter
+	// Rewriter 非 nil 且启用时：POST /v1/search 先多路改写再并行召回（见 queryrewrite.RunTextRetrievalWithOptionalRewrite）。
+	Rewriter queryrewrite.Rewriter
 }
 
 // NewMilvusSearcher repo 必填；Emb 可为 nil（仅 text 直查会报错）；es 可为 nil（无 ES 混合）。
@@ -63,22 +63,23 @@ func (s *MilvusSearcher) searchPublicVector(ctx context.Context, in SearchInput)
 		return nil, fmt.Errorf("query is required")
 	}
 	mode := recall.ParseMode(in.Retrieval)
-	res, rewrites, err := recall.RunTextRetrievalWithOptionalRewrite(ctx, recall.Deps{
+	res, rewrites, err := queryrewrite.RunTextRetrievalWithOptionalRewrite(ctx, recall.Deps{
 		ES:       s.ES,
 		Milvus:   s.Repo,
 		Embedder: s.Emb,
-	}, mode, q, topK, s.Rewriter)
+	}, mode, q, topK, s.Rewriter, in.OnRewriteQueryLine, in.RequestID)
 	if err != nil {
 		return nil, err
 	}
 	hits := recallHitsToSearchHits(res.Hits)
 	out := s.chunkLookupOutput(hits)
-	if in.IncludeDebug {
-		out.Debug = &SearchDebug{
-			Rewrites:     rewrites,
-			RecallCounts: res.RecallCounts,
-			MergedCount:  res.MergedCount,
+	if in.IncludeDebug || in.OnRewriteQueryLine != nil {
+		d := &SearchDebug{Rewrites: rewrites}
+		if in.IncludeDebug {
+			d.RecallCounts = res.RecallCounts
+			d.MergedCount = res.MergedCount
 		}
+		out.Debug = d
 	}
 	return out, nil
 }

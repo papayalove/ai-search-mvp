@@ -20,6 +20,13 @@ func (w *statusRecorder) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 }
 
+// Flush 实现 http.Flusher，供 SSE 等流式响应使用；内层不支持时为空操作。
+func (w *statusRecorder) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // NoteIngestFilenames 供 POST /v1/admin/ingest 等在处理早期登记入参文件名，供 AccessLog 打印。
 // w 须为本包 AccessLog 注入的 ResponseWriter；否则静默忽略。
 func NoteIngestFilenames(w http.ResponseWriter, names []string) {

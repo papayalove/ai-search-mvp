@@ -2,6 +2,7 @@ package recall
 
 import (
 	"context"
+	"log"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ func RecallES(ctx context.Context, repo *es.Repository, keys []string, topK int)
 	if len(keys) == 0 {
 		return nil, nil
 	}
+	log.Printf("search: request_id=%s phase=es_search_begin entity_keys=%d top_k=%d", requestIDFromCtx(ctx), len(keys), topK)
 	hits, err := repo.SearchByEntityKeys(ctx, keys, topK)
 	if err != nil {
 		return nil, err

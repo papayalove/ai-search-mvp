@@ -3,10 +3,13 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
 	"ai-search-v1/internal/api/dto"
+	"ai-search-v1/internal/api/middleware"
 	"ai-search-v1/internal/query/pipeline"
 )
 
@@ -57,20 +60,35 @@ func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		IncludeDebug: includeDebug,
 		Retrieval:    strings.TrimSpace(req.Retrieval),
 	}
-	out, err := h.Searcher.Search(r.Context(), in)
-	if err != nil {
-		msg := err.Error()
-		if strings.Contains(msg, "requires embedding") || strings.Contains(msg, "chunk lookup embed") || strings.Contains(msg, "embedder is nil") {
-			writeJSON(w, http.StatusServiceUnavailable, errBody("embed_required", msg))
-			return
-		}
-		if strings.Contains(msg, "elasticsearch is disabled") {
-			writeJSON(w, http.StatusServiceUnavailable, errBody("es_disabled", msg))
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, errBody("search_failed", msg))
+	if strings.TrimSpace(in.RequestID) == "" {
+		in.RequestID = middleware.RequestIDFromContext(r)
+	}
+	if req.Stream {
+		h.serveSearchStream(w, r, in)
 		return
 	}
+	out, err := h.Searcher.Search(r.Context(), in)
+	if err != nil {
+		writeSearchErrorJSON(w, err)
+		return
+	}
+	writeSearchOKJSON(w, out)
+}
+
+func writeSearchErrorJSON(w http.ResponseWriter, err error) {
+	msg := err.Error()
+	if strings.Contains(msg, "requires embedding") || strings.Contains(msg, "chunk lookup embed") || strings.Contains(msg, "embedder is nil") {
+		writeJSON(w, http.StatusServiceUnavailable, errBody("embed_required", msg))
+		return
+	}
+	if strings.Contains(msg, "elasticsearch is disabled") {
+		writeJSON(w, http.StatusServiceUnavailable, errBody("es_disabled", msg))
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, errBody("search_failed", msg))
+}
+
+func writeSearchOKJSON(w http.ResponseWriter, out *pipeline.SearchOutput) {
 	resp := dto.SearchResponse{Hits: toDTOHits(out.Hits)}
 	if out.Debug != nil {
 		resp.Debug = &dto.SearchDebug{
@@ -80,6 +98,92 @@ func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *SearchHandler) serveSearchStream(w http.ResponseWriter, r *http.Request, in pipeline.SearchInput) {
+	rid := strings.TrimSpace(in.RequestID)
+	if rid == "" {
+		rid = "-"
+	}
+	qPrev := strings.TrimSpace(in.Query)
+	if len(qPrev) > 80 {
+		qPrev = qPrev[:80] + "…"
+	}
+	log.Printf("search stream: request_id=%s begin query=%q top_k=%d retrieval=%q", rid, qPrev, in.TopK, in.Retrieval)
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, errBody("stream_not_supported", "response writer cannot flush"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	_, _ = fmt.Fprintf(w, ": stream\n\n")
+	fl.Flush()
+
+	writeEv := func(event string, v any) bool {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return false
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(b)); err != nil {
+			return false
+		}
+		fl.Flush()
+		return true
+	}
+
+	in.OnRewriteQueryLine = func(q string) error {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			return nil
+		}
+		if !writeEv("rewrite_query", map[string]string{"query": q}) {
+			return fmt.Errorf("client gone")
+		}
+		return nil
+	}
+
+	out, err := h.Searcher.Search(r.Context(), in)
+	if err != nil {
+		code, msg := searchErrCodeMessage(err)
+		log.Printf("search stream: request_id=%s end ERROR code=%s msg=%s", rid, code, msg)
+		_ = writeEv("error", map[string]string{"code": code, "message": msg})
+		return
+	}
+
+	q0 := strings.TrimSpace(in.Query)
+	rewrites := []string{q0}
+	if out.Debug != nil && len(out.Debug.Rewrites) > 0 {
+		rewrites = out.Debug.Rewrites
+	}
+	if !writeEv("rewrite_queries", map[string][]string{"queries": rewrites}) {
+		return
+	}
+
+	resp := dto.SearchResponse{Hits: toDTOHits(out.Hits)}
+	if out.Debug != nil {
+		resp.Debug = &dto.SearchDebug{
+			Rewrites:     out.Debug.Rewrites,
+			RecallCounts: out.Debug.RecallCounts,
+			MergedCount:  out.Debug.MergedCount,
+		}
+	}
+	_ = writeEv("done", resp)
+	log.Printf("search stream: request_id=%s done hits=%d rewrite_paths=%d", rid, len(out.Hits), len(rewrites))
+}
+
+func searchErrCodeMessage(err error) (code, msg string) {
+	msg = err.Error()
+	switch {
+	case strings.Contains(msg, "requires embedding") || strings.Contains(msg, "chunk lookup embed") || strings.Contains(msg, "embedder is nil"):
+		return "embed_required", msg
+	case strings.Contains(msg, "elasticsearch is disabled"):
+		return "es_disabled", msg
+	default:
+		return "search_failed", msg
+	}
 }
 
 func validateSearchRequest(req *dto.SearchRequest) error {

@@ -1,3 +1,3 @@
-// Package rewrite 实现设计文档 §5「5 路 query 重写」的模型侧客户端（阿里云 DashScope OpenAI 兼容 Chat）。
-// 编排与多路并行召回在 internal/query/recall（RunParallelTextRetrieval）。
+// Package rewrite 提供 OpenAI 兼容 Chat Completions 的底层 HTTP 调用（如阿里云 DashScope）。
+// 提示词、子查询 JSON 解析与检索侧编排见 internal/query/rewrite。
 package rewrite

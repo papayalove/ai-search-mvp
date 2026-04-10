@@ -48,6 +48,36 @@ type Result struct {
 	MergedCount  int
 }
 
+// hybridRecallWithVector 在已嵌入的前提下做 Milvus+ES 混合（供单路与批量嵌入后的子查询）。
+func hybridRecallWithVector(ctx context.Context, d Deps, query string, topK int, vec []float32) (*Result, error) {
+	keys := EntityKeysFromQuery(query)
+	mvHits, err := RecallMilvusVector(ctx, d.Milvus, vec, topK)
+	if err != nil {
+		return nil, err
+	}
+	var esHits []Hit
+	if d.ES != nil && len(keys) > 0 {
+		var esErr error
+		esHits, esErr = RecallES(ctx, d.ES, keys, topK)
+		if esErr != nil {
+			log.Printf("recall hybrid: es recall error (continuing with milvus): %v", esErr)
+			esHits = nil
+		}
+	} else if d.ES == nil && len(keys) > 0 {
+		log.Printf("recall hybrid: elasticsearch disabled, using milvus only")
+	}
+	merged := MergeDedupeMilvusFirst(mvHits, esHits, topK)
+	return &Result{
+		Hits: merged,
+		RecallCounts: map[string]int{
+			"milvus": len(mvHits),
+			"es":     len(esHits),
+			"merged": len(merged),
+		},
+		MergedCount: len(merged),
+	}, nil
+}
+
 // RunTextRetrieval 统一入口：es | milvus | hybrid。
 func RunTextRetrieval(ctx context.Context, d Deps, mode Mode, query string, topK int) (*Result, error) {
 	query = strings.TrimSpace(query)
@@ -95,32 +125,19 @@ func RunTextRetrieval(ctx context.Context, d Deps, mode Mode, query string, topK
 		if d.Milvus == nil || d.Embedder == nil {
 			return nil, fmt.Errorf("recall: milvus or embedder is nil (mode=hybrid)")
 		}
-		keys := EntityKeysFromQuery(query)
-		mvHits, err := RecallMilvusText(ctx, d.Milvus, d.Embedder, query, topK)
+		query = strings.TrimSpace(query)
+		if query == "" {
+			return nil, fmt.Errorf("recall: empty query")
+		}
+		log.Printf("search: request_id=%s phase=embed_begin n_texts=1 (hybrid single)", requestIDFromCtx(ctx))
+		vecs, err := d.Embedder.Embed(ctx, []string{query})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("recall hybrid embed: %w", err)
 		}
-		var esHits []Hit
-		if d.ES != nil && len(keys) > 0 {
-			var esErr error
-			esHits, esErr = RecallES(ctx, d.ES, keys, topK)
-			if esErr != nil {
-				log.Printf("recall hybrid: es recall error (continuing with milvus): %v", esErr)
-				esHits = nil
-			}
-		} else if d.ES == nil && len(keys) > 0 {
-			log.Printf("recall hybrid: elasticsearch disabled, using milvus only")
+		if len(vecs) != 1 {
+			return nil, fmt.Errorf("recall hybrid: expected 1 query vector, got %d", len(vecs))
 		}
-		merged := MergeDedupeMilvusFirst(mvHits, esHits, topK)
-		return &Result{
-			Hits: merged,
-			RecallCounts: map[string]int{
-				"milvus": len(mvHits),
-				"es":     len(esHits),
-				"merged": len(merged),
-			},
-			MergedCount: len(merged),
-		}, nil
+		return hybridRecallWithVector(ctx, d, query, topK, vecs[0])
 
 	default:
 		return RunTextRetrieval(ctx, d, ModeHybrid, query, topK)
