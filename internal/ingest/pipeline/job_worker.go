@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"ai-search-v1/internal/ingest/chunk"
+	"ai-search-v1/internal/ingest/meta"
 	"ai-search-v1/internal/queue"
 	storages3 "ai-search-v1/internal/storage/s3"
 )
@@ -17,33 +19,58 @@ type JobWorker struct {
 	Runner *Runner
 	Broker *queue.RedisBroker
 	S3     *storages3.Client
+	Meta   *ingestmeta.Service
+	// UseServerIngestTime 为 true 时 NDJSON 行内时间戳被忽略，见 NDJSONRunOptions.UseServerIngestTime。
+	UseServerIngestTime bool
 }
 
 // ProcessJob 执行单条入库任务（末尾 Flush 一次）。
-func (w *JobWorker) ProcessJob(ctx context.Context, j queue.Job, co chunk.RecursiveChunkOptions) error {
+func (w *JobWorker) ProcessJob(ctx context.Context, j queue.Job, co chunk.RecursiveChunkOptions) (err error) {
 	if w == nil || w.Runner == nil {
 		return fmt.Errorf("job worker: nil runner")
 	}
+	metaOn := w.Meta != nil && w.Meta.Enabled()
+	if metaOn {
+		if err := w.Meta.OnWorkerJobStart(ctx, j.JobID); err != nil {
+			return err
+		}
+		defer func() {
+			if err != nil {
+				_ = w.Meta.OnWorkerJobFailed(ctx, j.JobID, err)
+			} else {
+				_ = w.Meta.OnWorkerJobSucceeded(ctx, j.JobID)
+			}
+		}()
+	}
 	base := NDJSONRunOptions{
-		Partition:   strings.TrimSpace(j.Partition),
-		Upsert:      j.Upsert,
-		ChunkExpand: j.ChunkExpand,
-		ChunkOpts:   co,
-		Flush:       false,
-		JobID:       strings.TrimSpace(j.JobID),
-		TaskID:      strings.TrimSpace(j.TaskID),
+		Partition:           strings.TrimSpace(j.Partition),
+		Upsert:              j.Upsert,
+		ChunkExpand:         j.ChunkExpand,
+		ChunkOpts:           co,
+		Flush:               false,
+		JobID:               strings.TrimSpace(j.JobID),
+		TaskID:              strings.TrimSpace(j.TaskID),
+		UseServerIngestTime: w.UseServerIngestTime,
 	}
 	switch j.PayloadKind {
 	case queue.PayloadKindMultipartRedis:
-		return w.processMultipart(ctx, j, base)
+		err = w.processMultipart(ctx, j, base, metaOn)
 	case queue.PayloadKindS3:
-		return w.processS3(ctx, j, base)
+		err = w.processS3(ctx, j, base, metaOn)
 	default:
-		return fmt.Errorf("unknown payload_kind %q", j.PayloadKind)
+		err = fmt.Errorf("unknown payload_kind %q", j.PayloadKind)
 	}
+	return err
 }
 
-func (w *JobWorker) processMultipart(ctx context.Context, j queue.Job, base NDJSONRunOptions) error {
+func taskIDForMultipartFile(j queue.Job, f queue.FileRef) string {
+	if tid := strings.TrimSpace(f.TaskID); tid != "" {
+		return tid
+	}
+	return strings.TrimSpace(j.TaskID)
+}
+
+func (w *JobWorker) processMultipart(ctx context.Context, j queue.Job, base NDJSONRunOptions, metaOn bool) error {
 	if w.Broker == nil {
 		return fmt.Errorf("multipart job requires redis broker")
 	}
@@ -53,9 +80,18 @@ func (w *JobWorker) processMultipart(ctx context.Context, j queue.Job, base NDJS
 			continue
 		}
 		payloadKeys = append(payloadKeys, f.PayloadKey)
+		taskID := taskIDForMultipartFile(j, f)
 		body, err := w.Broker.GetPayload(ctx, f.PayloadKey)
 		if err != nil {
+			if metaOn && taskID != "" {
+				_ = w.Meta.OnTaskFailed(ctx, j.JobID, taskID, err)
+			}
 			return fmt.Errorf("redis get %q: %w", f.PayloadKey, err)
+		}
+		if metaOn && taskID != "" {
+			if err := w.Meta.OnTaskRunning(ctx, taskID); err != nil {
+				return err
+			}
 		}
 		ext := strings.ToLower(strings.TrimSpace(filepath.Ext(f.Filename)))
 		plain := PlainRunOptions{
@@ -65,7 +101,7 @@ func (w *JobWorker) processMultipart(ctx context.Context, j queue.Job, base NDJS
 			ChunkOpts:   base.ChunkOpts,
 			Flush:       false,
 			JobID:       base.JobID,
-			TaskID:      base.TaskID,
+			TaskID:      taskID,
 			SourceType:  strings.TrimSpace(j.SourceType),
 			Lang:        strings.TrimSpace(j.Lang),
 			DocID:       strings.TrimSpace(j.DocID),
@@ -75,17 +111,28 @@ func (w *JobWorker) processMultipart(ctx context.Context, j queue.Job, base NDJS
 		var runErr error
 		switch ext {
 		case ".ndjson", ".jsonl":
-			st, runErr = w.Runner.RunNDJSON(ctx, bytes.NewReader(body), base)
+			opt := base
+			opt.TaskID = taskID
+			st, runErr = w.Runner.RunNDJSON(ctx, bytes.NewReader(body), opt)
 		case ".txt", ".md", ".markdown":
 			plain.ChunkID = strings.TrimSpace(j.ChunkID)
 			st, runErr = w.Runner.RunPlain(ctx, string(body), plain)
 		default:
-			return fmt.Errorf("unsupported file type %q", ext)
+			runErr = fmt.Errorf("unsupported file type %q", ext)
 		}
-		if runErr != nil {
+		if metaOn && taskID != "" {
+			if runErr != nil {
+				if e := w.Meta.OnTaskFailed(ctx, j.JobID, taskID, runErr); e != nil {
+					return e
+				}
+				return runErr
+			}
+			if e := w.Meta.OnTaskSucceeded(ctx, j.JobID, taskID, int64(st.InputLines), int64(st.ChunksWritten)); e != nil {
+				return e
+			}
+		} else if runErr != nil {
 			return runErr
 		}
-		_ = st
 	}
 	if err := w.Runner.Flush(ctx); err != nil {
 		return err
@@ -94,7 +141,7 @@ func (w *JobWorker) processMultipart(ctx context.Context, j queue.Job, base NDJS
 	return nil
 }
 
-func (w *JobWorker) processS3(ctx context.Context, j queue.Job, base NDJSONRunOptions) error {
+func (w *JobWorker) processS3(ctx context.Context, j queue.Job, base NDJSONRunOptions, metaOn bool) error {
 	if w.S3 == nil {
 		return fmt.Errorf("s3 job requires s3 client")
 	}
@@ -128,10 +175,8 @@ func (w *JobWorker) processS3(ctx context.Context, j queue.Job, base NDJSONRunOp
 		}
 		keys = append(keys, listed...)
 	}
-	if len(keys) == 0 {
-		return fmt.Errorf("s3 job: no keys to read")
-	}
 	seen := map[string]struct{}{}
+	var uniq []string
 	for _, key := range keys {
 		key = strings.TrimSpace(key)
 		if key == "" {
@@ -141,16 +186,50 @@ func (w *JobWorker) processS3(ctx context.Context, j queue.Job, base NDJSONRunOp
 			continue
 		}
 		seen[key] = struct{}{}
+		uniq = append(uniq, key)
+	}
+	sort.Strings(uniq)
+	if len(uniq) == 0 {
+		return fmt.Errorf("s3 job: no keys to read")
+	}
+	if metaOn && j.S3DeferTaskES {
+		if err := w.Meta.AfterS3List(ctx, j.JobID, bucket, uniq); err != nil {
+			return err
+		}
+	}
+	for _, key := range uniq {
+		tid := ingestmeta.S3TaskID(j.JobID, key)
+		if metaOn {
+			if err := w.Meta.OnTaskRunning(ctx, tid); err != nil {
+				return err
+			}
+		}
 		rc, err := w.S3.GetObjectBody(ctx, bucket, key)
 		if err != nil {
+			if metaOn {
+				if e := w.Meta.OnTaskFailed(ctx, j.JobID, tid, err); e != nil {
+					return e
+				}
+			}
 			return fmt.Errorf("s3 get %s/%s: %w", bucket, key, err)
 		}
-		st, err := w.Runner.RunNDJSON(ctx, rc, base)
+		opt := base
+		opt.TaskID = tid
+		st, err := w.Runner.RunNDJSON(ctx, rc, opt)
 		_ = rc.Close()
-		if err != nil {
+		if metaOn {
+			if err != nil {
+				if e := w.Meta.OnTaskFailed(ctx, j.JobID, tid, err); e != nil {
+					return e
+				}
+				return fmt.Errorf("run ndjson for %s: %w", key, err)
+			}
+			if e := w.Meta.OnTaskSucceeded(ctx, j.JobID, tid, int64(st.InputLines), int64(st.ChunksWritten)); e != nil {
+				return e
+			}
+		} else if err != nil {
 			return fmt.Errorf("run ndjson for %s: %w", key, err)
 		}
-		_ = st
 	}
 	return w.Runner.Flush(ctx)
 }

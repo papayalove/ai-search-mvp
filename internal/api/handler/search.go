@@ -55,12 +55,17 @@ func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Filters:      req.Filters,
 		RequestID:    req.RequestID,
 		IncludeDebug: includeDebug,
+		Retrieval:    strings.TrimSpace(req.Retrieval),
 	}
 	out, err := h.Searcher.Search(r.Context(), in)
 	if err != nil {
 		msg := err.Error()
-		if strings.Contains(msg, "requires embedding") || strings.Contains(msg, "chunk lookup embed") {
+		if strings.Contains(msg, "requires embedding") || strings.Contains(msg, "chunk lookup embed") || strings.Contains(msg, "embedder is nil") {
 			writeJSON(w, http.StatusServiceUnavailable, errBody("embed_required", msg))
+			return
+		}
+		if strings.Contains(msg, "elasticsearch is disabled") {
+			writeJSON(w, http.StatusServiceUnavailable, errBody("es_disabled", msg))
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, errBody("search_failed", msg))

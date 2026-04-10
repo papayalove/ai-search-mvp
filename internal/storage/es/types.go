@@ -26,5 +26,6 @@ type EntityRecallHit struct {
 	JobID       string
 	TaskID      string
 	Score       float64
+	CreatedTime time.Time
 	UpdatedTime time.Time
 }

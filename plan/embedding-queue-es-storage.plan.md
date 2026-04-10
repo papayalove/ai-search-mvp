@@ -85,7 +85,7 @@ sequenceDiagram
 
 ### 2.1 Job 类型、载荷与 Redis TTL
 
-**公共字段**：`job_id`；**payload_kind**（如 `multipart_redis` | `s3`，与表单 `source_type` web/pdf 区分）；管道参数（`partition`、`upsert`、`chunk_expand`、`source_type`、`lang`、`doc_id`、`page_no` 等）；可选 `task_id`。
+**公共字段**：`job_id`；**payload_kind**（如 `multipart_redis` | `s3`，与表单 `source_type` web/pdf 区分）；管道参数（`partition`、`upsert`、`chunk_expand`、`source_type`、`lang`、`doc_id`、`page_no` 等）；**`task_id` 为文件级 Task**（见 §4.1），当前队列 JSON 可能仅在 Job 层带一个可选值，**多文件时应与每文件对齐**（实现演进与 [plan/ingest-metadata-mysql-es.plan.md](ingest-metadata-mysql-es.plan.md) §4 一致）。
 
 **类型 A — multipart**：每个文件 **正文存 Redis**（建议独立 key，如 `payload:<job_id>:<n>`），**过期时间 3 小时（10800s）**；队列消息含 `payload_redis_key`、文件名、扩展名提示等。Worker 处理完可 **DEL payload** 或依赖 TTL。
 
@@ -154,7 +154,7 @@ sequenceDiagram
 ### 4.1 字段语义（建议）
 
 - **job_id**：本次**入库队列任务** ID（UUID/ULID），由 API 在入队时生成并贯穿 ES/Milvus，便于按批次排查与清理。
-- **task_id**：调用方可选业务 ID（如爬虫任务、数据集版本）；keyword，可空。
+- **task_id**：**文件级 Task ID**（一次入库 `job_id` 下的**单个输入文件**）；chunk 行携带所属文件的 `task_id`，便于按文件过滤与排查；keyword，可空（未落到文件粒度时）。
 - **extra_info**：JSON 对象（键值均为可索引的简单类型为佳）；用于扩展元数据，**不替代** `doc_id`/`source_type`/`lang` 等一阶字段。
 - **删除 `ts`**；新增 **created_time**、**update_time**：
   - **ES**：`date` 类型（RFC3339 或 `strict_date_optional_time`）。

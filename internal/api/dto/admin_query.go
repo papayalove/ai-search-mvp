@@ -6,6 +6,8 @@ type AdminQueryRequest struct {
 	SearchType string `json:"search_type"`
 	Q          string `json:"q"`
 	Limit      int    `json:"limit"`
+	// RetrievalMode 仅 search_type=text 且 q 非空时生效：hybrid（默认）| milvus | es
+	RetrievalMode string `json:"retrieval_mode,omitempty"`
 }
 
 // AdminQueryResponse 管理端查询结果。
@@ -28,4 +30,6 @@ type AdminQueryRecord struct {
 	VectorDim  int               `json:"vector_dim"`
 	Metadata   map[string]string `json:"metadata"`
 	CreatedAt  string            `json:"created_at"`
+	// RecallSource 混合检索：milvus | es | both
+	RecallSource string `json:"recall_source,omitempty"`
 }

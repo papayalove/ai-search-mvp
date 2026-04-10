@@ -6,6 +6,9 @@ import (
 	"strings"
 
 	"ai-search-v1/internal/model/embedding"
+	modelrewrite "ai-search-v1/internal/model/rewrite"
+	"ai-search-v1/internal/query/recall"
+	"ai-search-v1/internal/storage/es"
 	"ai-search-v1/internal/storage/milvus"
 )
 
@@ -26,11 +29,14 @@ const (
 type MilvusSearcher struct {
 	Repo *milvus.Repository
 	Emb  embedding.Embedder
+	ES   *es.Repository // 可选；用于 hybrid / es 文本检索
+	// Rewriter 非 nil 且启用时：POST /v1/search 先多路改写再并行召回（见 recall.RunTextRetrievalWithOptionalRewrite）。
+	Rewriter modelrewrite.Rewriter
 }
 
-// NewMilvusSearcher repo 必填；Emb 可为 nil（仅 text 直查会报错）。
-func NewMilvusSearcher(repo *milvus.Repository, emb embedding.Embedder) *MilvusSearcher {
-	return &MilvusSearcher{Repo: repo, Emb: emb}
+// NewMilvusSearcher repo 必填；Emb 可为 nil（仅 text 直查会报错）；es 可为 nil（无 ES 混合）。
+func NewMilvusSearcher(repo *milvus.Repository, emb embedding.Embedder, es *es.Repository) *MilvusSearcher {
+	return &MilvusSearcher{Repo: repo, Emb: emb, ES: es}
 }
 
 func (s *MilvusSearcher) Search(ctx context.Context, in SearchInput) (*SearchOutput, error) {
@@ -43,7 +49,7 @@ func (s *MilvusSearcher) Search(ctx context.Context, in SearchInput) (*SearchOut
 	return s.searchPublicVector(ctx, in)
 }
 
-// searchPublicVector 对应 POST /v1/search：与 admin query 的 text 模式相同，对 query 做嵌入后在 Milvus 上做向量相似度检索。
+// searchPublicVector 对应 POST /v1/search：默认 hybrid（ES 实体 + Milvus 向量去重），可 retrieval=milvus|es。
 func (s *MilvusSearcher) searchPublicVector(ctx context.Context, in SearchInput) (*SearchOutput, error) {
 	topK := in.TopK
 	if topK <= 0 {
@@ -56,19 +62,22 @@ func (s *MilvusSearcher) searchPublicVector(ctx context.Context, in SearchInput)
 	if q == "" {
 		return nil, fmt.Errorf("query is required")
 	}
-	if s.Emb == nil {
-		return nil, fmt.Errorf("search requires embedding.enabled in config")
-	}
-	hits, err := s.queryByText(ctx, q, topK)
+	mode := recall.ParseMode(in.Retrieval)
+	res, rewrites, err := recall.RunTextRetrievalWithOptionalRewrite(ctx, recall.Deps{
+		ES:       s.ES,
+		Milvus:   s.Repo,
+		Embedder: s.Emb,
+	}, mode, q, topK, s.Rewriter)
 	if err != nil {
 		return nil, err
 	}
+	hits := recallHitsToSearchHits(res.Hits)
 	out := s.chunkLookupOutput(hits)
 	if in.IncludeDebug {
 		out.Debug = &SearchDebug{
-			Rewrites:     nil,
-			RecallCounts: map[string]int{},
-			MergedCount:  len(hits),
+			Rewrites:     rewrites,
+			RecallCounts: res.RecallCounts,
+			MergedCount:  res.MergedCount,
 		}
 	}
 	return out, nil
@@ -102,7 +111,23 @@ func (s *MilvusSearcher) searchChunkLookup(ctx context.Context, in SearchInput) 
 	case "chunk_id", "id":
 		hits, err = s.queryByChunkIDField(ctx, qstr, int64(limit))
 	case "text":
-		hits, err = s.queryByText(ctx, qstr, limit)
+		res, err2 := recall.RunTextRetrieval(ctx, recall.Deps{
+			ES:       s.ES,
+			Milvus:   s.Repo,
+			Embedder: s.Emb,
+		}, recall.ParseMode(in.Retrieval), qstr, limit)
+		if err2 != nil {
+			return nil, err2
+		}
+		hits = recallHitsToSearchHits(res.Hits)
+		out := s.chunkLookupOutput(hits)
+		if in.IncludeDebug {
+			out.Debug = &SearchDebug{
+				RecallCounts: res.RecallCounts,
+				MergedCount:  res.MergedCount,
+			}
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("chunk lookup: invalid mode %q (use file_name, chunk_id, text)", st)
 	}
@@ -185,6 +210,7 @@ func (s *MilvusSearcher) queryByText(ctx context.Context, text string, topK int)
 			SourceType: m.SourceType,
 			Lang:       m.Lang,
 			Ts:         m.UpdatedTime,
+			CreatedTs:  m.CreatedTime,
 			Score:      float64(m.Score),
 			URLOrDocID: m.DocID,
 			Title:      m.ChunkID,
@@ -206,9 +232,35 @@ func recordsToSearchHits(recs []milvus.ChunkRecord, score float64) []SearchHit {
 			SourceType: r.SourceType,
 			Lang:       r.Lang,
 			Ts:         r.UpdatedTime,
+			CreatedTs:  r.CreatedTime,
 			Score:      score,
 			URLOrDocID: r.DocID,
 			Title:      r.ChunkID,
+		}
+	}
+	return out
+}
+
+func recallHitsToSearchHits(in []recall.Hit) []SearchHit {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]SearchHit, len(in))
+	for i := range in {
+		h := in[i]
+		out[i] = SearchHit{
+			ChunkID:      h.ChunkID,
+			DocID:        h.DocID,
+			Snippet:      h.Snippet,
+			Score:        h.Score,
+			SourceType:   h.SourceType,
+			Lang:         h.Lang,
+			Ts:           h.Ts,
+			CreatedTs:    h.CreatedTs,
+			URLOrDocID:   h.URLOrDocID,
+			PDFPage:      h.PDFPage,
+			Title:        h.Title,
+			RecallSource: h.RecallSource,
 		}
 	}
 	return out

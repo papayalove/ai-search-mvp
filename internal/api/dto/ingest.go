@@ -18,6 +18,7 @@ type IngestResponse struct {
 type IngestAcceptedFile struct {
 	Name       string `json:"name"`
 	PayloadKey string `json:"payload_key,omitempty"`
+	TaskID     string `json:"task_id,omitempty"`
 }
 
 // IngestAcceptedResponse POST /v1/admin/ingest 异步入队 202。
@@ -29,6 +30,7 @@ type IngestAcceptedResponse struct {
 
 // IngestRemoteRequest POST /v1/admin/ingest/remote JSON。
 type IngestRemoteRequest struct {
+	JobName     string   `json:"job_name"`
 	S3URIs      []string `json:"s3_uris"`
 	Bucket      string   `json:"bucket"`
 	Keys        []string `json:"keys"`

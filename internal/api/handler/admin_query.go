@@ -60,9 +60,11 @@ func (h *AdminQueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 	in := pipeline.SearchInput{
-		Query:      req.Q,
-		TopK:       limit,
-		SearchType: searchType,
+		Query:        req.Q,
+		TopK:         limit,
+		SearchType:   searchType,
+		Retrieval:    strings.TrimSpace(req.RetrievalMode),
+		IncludeDebug: false,
 	}
 	if inJSON, err := json.Marshal(in); err == nil {
 		log.Printf("admin/query: pipeline.SearchInput request_id=%s json=%s", rid, inJSON)
@@ -76,6 +78,10 @@ func (h *AdminQueryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.Contains(msg, "invalid mode") || strings.Contains(msg, "requires Milvus") {
 			writeJSON(w, http.StatusBadRequest, errBody("invalid_request", msg))
+			return
+		}
+		if strings.Contains(msg, "elasticsearch is disabled") {
+			writeJSON(w, http.StatusServiceUnavailable, errBody("es_disabled", msg))
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, errBody("admin_query_failed", msg))
@@ -117,26 +123,36 @@ func searchHitToAdminRecord(hit pipeline.SearchHit, collection string, vectorDim
 	if hit.Score != 0 {
 		meta["score"] = fmt.Sprintf("%g", hit.Score)
 	}
-	ts := hit.Ts
-	if ts <= 0 {
-		ts = time.Now().UnixMilli()
+	// Ts：更新时间（JSON ts）；CreatedAt：创建时间，来自 Milvus/ES 的 created，避免把 updated 误标为 Created、避免 Ts=0 时用 Now() 造假。
+	updatedMs := hit.Ts
+	createdMs := hit.CreatedTs
+	if createdMs <= 0 && updatedMs > 0 {
+		createdMs = updatedMs
 	}
-	t := time.UnixMilli(ts).UTC()
+	var createdAt string
+	if createdMs > 0 {
+		createdAt = time.UnixMilli(createdMs).UTC().Format(time.RFC3339Nano)
+	}
+	tsOut := updatedMs
+	if tsOut <= 0 && createdMs > 0 {
+		tsOut = createdMs
+	}
 	id := hit.ChunkID
 	return dto.AdminQueryRecord{
-		ID:         id,
-		ChunkID:    id,
-		DocID:      hit.DocID,
-		FileName:   deriveFileNameFromChunkID(id),
+		ID:           id,
+		ChunkID:      id,
+		DocID:        hit.DocID,
+		FileName:     deriveFileNameFromChunkID(id),
 		Collection: collection,
-		SourceType: hit.SourceType,
-		Lang:       hit.Lang,
-		Score:      hit.Score,
-		Ts:         ts,
-		Status:     "indexed",
-		VectorDim:  vectorDim,
-		Metadata:   meta,
-		CreatedAt:  t.Format(time.RFC3339Nano),
+		SourceType:   hit.SourceType,
+		Lang:         hit.Lang,
+		Score:        hit.Score,
+		Ts:           tsOut,
+		Status:       "indexed",
+		VectorDim:    vectorDim,
+		Metadata:     meta,
+		CreatedAt:    createdAt,
+		RecallSource: hit.RecallSource,
 	}
 }
 

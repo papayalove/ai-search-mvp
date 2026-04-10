@@ -15,11 +15,13 @@ const (
 type FileRef struct {
 	PayloadKey string `json:"payload_key"`
 	Filename   string `json:"filename"`
+	TaskID     string `json:"task_id,omitempty"`
 }
 
 // Job 入队 JSON（Redis List 一条元素）。
 type Job struct {
 	JobID       string    `json:"job_id"`
+	JobName     string    `json:"job_name,omitempty"`
 	PayloadKind string    `json:"payload_kind"`
 	Partition   string    `json:"partition,omitempty"`
 	Upsert      bool      `json:"upsert"`
@@ -35,6 +37,8 @@ type Job struct {
 	Bucket      string    `json:"bucket,omitempty"`
 	Keys        []string  `json:"keys,omitempty"`
 	Prefix      string    `json:"prefix,omitempty"`
+	// S3DeferTaskES 为 true 时仅 bucket+prefix 入队，Worker 在 list 后再写 ES Task 占位并更新 total_files。
+	S3DeferTaskES bool `json:"s3_defer_task_es,omitempty"`
 }
 
 // Marshal 序列化为 JSON 一行。

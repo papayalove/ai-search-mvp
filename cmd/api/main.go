@@ -9,10 +9,12 @@ import (
 
 	"ai-search-v1/internal/app"
 	"ai-search-v1/internal/config"
+	ingestmeta "ai-search-v1/internal/ingest/meta"
 	querypipe "ai-search-v1/internal/query/pipeline"
 	"ai-search-v1/internal/queue"
 	"ai-search-v1/internal/storage/es"
 	"ai-search-v1/internal/storage/milvus"
+	"ai-search-v1/internal/storage/mysqldb"
 )
 
 func main() {
@@ -29,6 +31,16 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	im := config.LoadIngestMetaFromEnv()
+	if err := mysqldb.Init(im.MySQLDSN); err != nil {
+		log.Fatalf("mysql init: %v", err)
+	}
+	defer func() { _ = mysqldb.CloseGlobal() }()
+	if mysqldb.Repo() != nil {
+		log.Print("mysql: global pool initialized (MYSQL_DSN)")
+	}
+
 	chOpts := apiCfg.Ingest.ToRecursiveChunkOptions()
 	qe := config.LoadIngestQueueFromEnv()
 	var ingestBroker *queue.RedisBroker
@@ -47,6 +59,8 @@ func main() {
 	}
 
 	var milvusRepo *milvus.Repository
+	var esRepo *es.Repository
+	var milvusSearcher *querypipe.MilvusSearcher
 	searcher := querypipe.Searcher(querypipe.StubSearcher{})
 	if apiCfg.Milvus.MilvusEnabled() {
 		mc := apiCfg.Milvus.ToMilvus()
@@ -63,11 +77,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("embedding: %v", err)
 		}
-		searcher = querypipe.NewMilvusSearcher(repo, emb)
-		log.Print("searcher: MilvusSearcher (POST /v1/admin/query chunk lookup; POST /v1/search vector ANN same as admin text)")
-		if emb == nil {
-			log.Print("embedding disabled: text chunk lookup and vector search need embedding.enabled: true")
-		}
 		if apiCfg.Elasticsearch.ElasticsearchEnabled() {
 			ec := apiCfg.Elasticsearch.ToElasticsearch()
 			if err := ec.Validate(); err != nil {
@@ -80,13 +89,40 @@ func main() {
 			if err := er.EnsureIndex(ctx); err != nil {
 				log.Fatalf("elasticsearch ensure index: %v", err)
 			}
+			esRepo = er
 			log.Printf("elasticsearch index %q ready (addr=%q)", ec.Index, ec.Addresses[0])
+		}
+		milvusSearcher = querypipe.NewMilvusSearcher(repo, emb, esRepo)
+		searcher = milvusSearcher
+		milvusSearcher.Rewriter = config.LoadRewriterFromEnv()
+		log.Print("searcher: MilvusSearcher (hybrid text search when ES enabled; POST /v1/search retrieval=hybrid|milvus|es)")
+		if emb == nil {
+			log.Print("embedding disabled: milvus-only text modes need embedding.enabled: true")
 		}
 	} else {
 		log.Print("milvus disabled in config (milvus.enabled: false)")
 	}
 
-	srv := app.NewHTTPServer(searcher, ingestBroker, qe, chOpts, milvusRepo)
+	var ingestMeta *ingestmeta.Service
+	if im.Enabled {
+		if mysqldb.Repo() == nil {
+			log.Fatal("ingest meta enabled but MYSQL_DSN is empty or mysql init failed")
+		}
+		var taskIdx *es.IngestTaskIndex
+		if esRepo != nil {
+			taskIdx = es.NewIngestTaskIndex(esRepo, im.TaskESIndex)
+			if err := taskIdx.EnsureIndex(ctx); err != nil {
+				log.Fatalf("ingest meta elasticsearch task index: %v", err)
+			}
+			log.Printf("ingest meta: elasticsearch task index %q ready", im.TaskESIndex)
+		} else {
+			log.Print("ingest meta: elasticsearch disabled; task documents will not be written (MySQL job rows only)")
+		}
+		ingestMeta = ingestmeta.NewService(mysqldb.Repo(), taskIdx)
+		log.Printf("ingest meta: mysql ingest_job enabled (INGEST_ES_TASK_INDEX=%q)", im.TaskESIndex)
+	}
+
+	srv := app.NewHTTPServer(searcher, ingestBroker, qe, chOpts, milvusRepo, ingestMeta)
 	log.Printf("api listening on %s (config %q)", addr, cfgPath)
 	if err := http.ListenAndServe(addr, srv); err != nil {
 		log.Fatal(err)

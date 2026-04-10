@@ -16,6 +16,7 @@ import (
 	"ai-search-v1/internal/api/middleware"
 	"ai-search-v1/internal/config"
 	"ai-search-v1/internal/ingest/chunk"
+	ingestmeta "ai-search-v1/internal/ingest/meta"
 	"ai-search-v1/internal/queue"
 )
 
@@ -29,14 +30,15 @@ type IngestHandler struct {
 	Broker    *queue.RedisBroker
 	QueueEnv  config.IngestQueueFromEnv
 	ChunkOpts chunk.RecursiveChunkOptions
+	Meta      *ingestmeta.Service
 }
 
 // NewIngestHandler broker 为 nil 时返回 nil（不注册路由）。
-func NewIngestHandler(b *queue.RedisBroker, qe config.IngestQueueFromEnv, co chunk.RecursiveChunkOptions) *IngestHandler {
+func NewIngestHandler(b *queue.RedisBroker, qe config.IngestQueueFromEnv, co chunk.RecursiveChunkOptions, meta *ingestmeta.Service) *IngestHandler {
 	if b == nil {
 		return nil
 	}
-	return &IngestHandler{Broker: b, QueueEnv: qe, ChunkOpts: co}
+	return &IngestHandler{Broker: b, QueueEnv: qe, ChunkOpts: co, Meta: meta}
 }
 
 func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +61,10 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	chunkIDForm := strings.TrimSpace(r.FormValue("chunk_id"))
 	docID := strings.TrimSpace(r.FormValue("doc_id"))
 	taskID := strings.TrimSpace(r.FormValue("task_id"))
+	jobName := strings.TrimSpace(r.FormValue("job_name"))
+	if jobName == "" {
+		jobName = "ingest"
+	}
 	pageNo := 0
 	if v := strings.TrimSpace(r.FormValue("page_no")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -110,12 +116,18 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, errBody("redis_failed", err.Error()))
 			return
 		}
-		files = append(files, queue.FileRef{PayloadKey: pkey, Filename: fh.Filename})
-		accepted = append(accepted, dto.IngestAcceptedFile{Name: fh.Filename, PayloadKey: pkey})
+		var perTask string
+		if h.Meta != nil && h.Meta.Enabled() {
+			perTask = uuid.New().String()
+		}
+		files = append(files, queue.FileRef{PayloadKey: pkey, Filename: fh.Filename, TaskID: perTask})
+		acc := dto.IngestAcceptedFile{Name: fh.Filename, PayloadKey: pkey, TaskID: perTask}
+		accepted = append(accepted, acc)
 	}
 
 	j := queue.Job{
 		JobID:       jobID,
+		JobName:     jobName,
 		PayloadKind: queue.PayloadKindMultipartRedis,
 		Partition:   partition,
 		Upsert:      upsert,
@@ -127,6 +139,13 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ChunkID:     chunkIDForm,
 		TaskID:      taskID,
 		Files:       files,
+	}
+	if h.Meta != nil && h.Meta.Enabled() {
+		if err := h.Meta.OnEnqueueMultipart(r.Context(), rid, jobName, j); err != nil {
+			log.Printf("admin/ingest: ingest meta fail request_id=%s job_id=%s err=%v", rid, jobID, err)
+			writeJSON(w, http.StatusInternalServerError, errBody("ingest_meta_failed", err.Error()))
+			return
+		}
 	}
 	if err := h.Broker.Enqueue(r.Context(), j, h.QueueEnv.MultipartPayloadTTL); err != nil {
 		log.Printf("admin/ingest: enqueue fail request_id=%s err=%v", rid, err)

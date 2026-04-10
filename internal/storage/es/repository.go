@@ -335,14 +335,15 @@ func (r *Repository) SearchByEntityKeys(ctx context.Context, keys []string, size
 			Hits []struct {
 				Score  float64 `json:"_score"`
 				Source struct {
-					EntityKeys []string `json:"entity_keys"`
-					ChunkID    string   `json:"chunk_id"`
-					DocID      string   `json:"doc_id"`
-					SourceType string   `json:"source_type"`
-					Lang       string   `json:"lang"`
-					JobID      string   `json:"job_id"`
-					TaskID     string   `json:"task_id"`
-					UpdateTime string   `json:"update_time"`
+					EntityKeys  []string `json:"entity_keys"`
+					ChunkID     string   `json:"chunk_id"`
+					DocID       string   `json:"doc_id"`
+					SourceType  string   `json:"source_type"`
+					Lang        string   `json:"lang"`
+					JobID       string   `json:"job_id"`
+					TaskID      string   `json:"task_id"`
+					CreatedTime string   `json:"created_time"`
+					UpdateTime  string   `json:"update_time"`
 				} `json:"_source"`
 			} `json:"hits"`
 		} `json:"hits"`
@@ -357,14 +358,20 @@ func (r *Repository) SearchByEntityKeys(ctx context.Context, keys []string, size
 			continue
 		}
 		matched := firstMatchedQueryKey(norm, h.Source.EntityKeys)
-		var ut time.Time
-		if h.Source.UpdateTime != "" {
-			if t, err := time.Parse(time.RFC3339Nano, h.Source.UpdateTime); err == nil {
-				ut = t
-			} else if t, err := time.Parse(time.RFC3339, h.Source.UpdateTime); err == nil {
-				ut = t
+		parseESDate := func(s string) time.Time {
+			if s == "" {
+				return time.Time{}
 			}
+			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+				return t
+			}
+			if t, err := time.Parse(time.RFC3339, s); err == nil {
+				return t
+			}
+			return time.Time{}
 		}
+		ct := parseESDate(h.Source.CreatedTime)
+		ut := parseESDate(h.Source.UpdateTime)
 		out = append(out, EntityRecallHit{
 			ChunkID:     cid,
 			EntityKey:   matched,
@@ -374,6 +381,7 @@ func (r *Repository) SearchByEntityKeys(ctx context.Context, keys []string, size
 			JobID:       h.Source.JobID,
 			TaskID:      h.Source.TaskID,
 			Score:       h.Score,
+			CreatedTime: ct,
 			UpdatedTime: ut,
 		})
 		if len(out) >= size {

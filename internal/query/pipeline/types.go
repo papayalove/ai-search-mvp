@@ -12,6 +12,8 @@ type SearchInput struct {
 	IncludeDebug bool
 
 	SearchType string `json:"search_type,omitempty"`
+	// Retrieval 文本检索模式：hybrid | milvus | es。公开搜索默认 hybrid；Admin text 默认 hybrid。
+	Retrieval string `json:"retrieval,omitempty"`
 }
 
 // SearchHit is one ranked evidence chunk returned to callers.
@@ -22,10 +24,15 @@ type SearchHit struct {
 	Score       float64
 	SourceType  string
 	Lang        string
-	Ts          int64
-	URLOrDocID  string
+	// Ts 为业务上的「更新时间」Unix 毫秒（原 Milvus updated_time / ES update_time）。
+	Ts int64
+	// CreatedTs 为「创建时间」Unix 毫秒（Milvus created_time / ES created_time）；0 表示未知。
+	CreatedTs int64
+	URLOrDocID string
 	PDFPage     *int
 	Title       string
+	// RecallSource 混合检索时：milvus | es | both（仅 Admin 等需要时可透出）。
+	RecallSource string `json:"recall_source,omitempty"`
 }
 
 // SearchDebug carries optional diagnostics for the search path.

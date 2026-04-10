@@ -12,6 +12,7 @@ import (
 	"ai-search-v1/internal/api/dto"
 	"ai-search-v1/internal/api/middleware"
 	"ai-search-v1/internal/config"
+	ingestmeta "ai-search-v1/internal/ingest/meta"
 	"ai-search-v1/internal/queue"
 )
 
@@ -19,14 +20,15 @@ import (
 type IngestRemoteHandler struct {
 	Broker   *queue.RedisBroker
 	QueueEnv config.IngestQueueFromEnv
+	Meta     *ingestmeta.Service
 }
 
 // NewIngestRemoteHandler broker 为 nil 时返回 nil。
-func NewIngestRemoteHandler(b *queue.RedisBroker, qe config.IngestQueueFromEnv) *IngestRemoteHandler {
+func NewIngestRemoteHandler(b *queue.RedisBroker, qe config.IngestQueueFromEnv, meta *ingestmeta.Service) *IngestRemoteHandler {
 	if b == nil {
 		return nil
 	}
-	return &IngestRemoteHandler{Broker: b, QueueEnv: qe}
+	return &IngestRemoteHandler{Broker: b, QueueEnv: qe, Meta: meta}
 }
 
 func (h *IngestRemoteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -62,21 +64,39 @@ func (h *IngestRemoteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 
 	jobID := uuid.New().String()
+	jobName := strings.TrimSpace(req.JobName)
+	if jobName == "" {
+		jobName = "ingest-remote"
+	}
+	deferTaskES := false
+	if h.Meta != nil && h.Meta.Enabled() {
+		deferTaskES = strings.TrimSpace(req.Bucket) != "" && strings.TrimSpace(req.Prefix) != "" &&
+			len(req.Keys) == 0 && len(req.S3URIs) == 0
+	}
 	j := queue.Job{
-		JobID:       jobID,
-		PayloadKind: queue.PayloadKindS3,
-		Partition:   strings.TrimSpace(req.Partition),
-		Upsert:      req.Upsert,
-		ChunkExpand: req.ChunkExpand,
-		SourceType:  strings.TrimSpace(req.SourceType),
-		Lang:        strings.TrimSpace(req.Lang),
-		DocID:       strings.TrimSpace(req.DocID),
-		PageNo:      req.PageNo,
-		TaskID:      strings.TrimSpace(req.TaskID),
-		S3URIs:      req.S3URIs,
-		Bucket:      strings.TrimSpace(req.Bucket),
-		Keys:        req.Keys,
-		Prefix:      strings.TrimSpace(req.Prefix),
+		JobID:           jobID,
+		JobName:         jobName,
+		PayloadKind:     queue.PayloadKindS3,
+		Partition:       strings.TrimSpace(req.Partition),
+		Upsert:          req.Upsert,
+		ChunkExpand:     req.ChunkExpand,
+		SourceType:      strings.TrimSpace(req.SourceType),
+		Lang:            strings.TrimSpace(req.Lang),
+		DocID:           strings.TrimSpace(req.DocID),
+		PageNo:          req.PageNo,
+		TaskID:          strings.TrimSpace(req.TaskID),
+		S3URIs:          req.S3URIs,
+		Bucket:          strings.TrimSpace(req.Bucket),
+		Keys:            req.Keys,
+		Prefix:          strings.TrimSpace(req.Prefix),
+		S3DeferTaskES:   deferTaskES,
+	}
+	if h.Meta != nil && h.Meta.Enabled() {
+		if err := h.Meta.OnEnqueueS3(r.Context(), rid, jobName, j, deferTaskES); err != nil {
+			log.Printf("admin/ingest/remote: ingest meta fail request_id=%s job_id=%s err=%v", rid, jobID, err)
+			writeJSON(w, http.StatusInternalServerError, errBody("ingest_meta_failed", err.Error()))
+			return
+		}
 	}
 	if err := h.Broker.Enqueue(r.Context(), j, h.QueueEnv.RemoteJobMetaTTL); err != nil {
 		log.Printf("admin/ingest/remote: enqueue fail request_id=%s err=%v", rid, err)

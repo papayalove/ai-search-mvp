@@ -7,6 +7,7 @@ import (
 	"ai-search-v1/internal/api/middleware"
 	"ai-search-v1/internal/config"
 	"ai-search-v1/internal/ingest/chunk"
+	ingestmeta "ai-search-v1/internal/ingest/meta"
 	querypipe "ai-search-v1/internal/query/pipeline"
 	"ai-search-v1/internal/queue"
 	"ai-search-v1/internal/storage/milvus"
@@ -14,15 +15,15 @@ import (
 
 // NewHTTPServer builds the API HTTP handler stack (middleware + routes).
 // ingestBroker 非 nil 时注册 POST /v1/admin/ingest 与 POST /v1/admin/ingest/remote（异步入队）。
-func NewHTTPServer(searcher querypipe.Searcher, ingestBroker *queue.RedisBroker, ingestQE config.IngestQueueFromEnv, ingestChunkOpts chunk.RecursiveChunkOptions, milvusRepo *milvus.Repository) http.Handler {
+func NewHTTPServer(searcher querypipe.Searcher, ingestBroker *queue.RedisBroker, ingestQE config.IngestQueueFromEnv, ingestChunkOpts chunk.RecursiveChunkOptions, milvusRepo *milvus.Repository, ingestMeta *ingestmeta.Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/search", handler.NewSearchHandler(searcher))
 	mux.Handle("GET /v1/admin/collections", handler.NewAdminCollectionsHandler(milvusRepo))
 	mux.Handle("GET /v1/admin/partitions", handler.NewAdminPartitionsHandler(milvusRepo))
-	if ih := handler.NewIngestHandler(ingestBroker, ingestQE, ingestChunkOpts); ih != nil {
+	if ih := handler.NewIngestHandler(ingestBroker, ingestQE, ingestChunkOpts, ingestMeta); ih != nil {
 		mux.Handle("POST /v1/admin/ingest", ih)
 	}
-	if ir := handler.NewIngestRemoteHandler(ingestBroker, ingestQE); ir != nil {
+	if ir := handler.NewIngestRemoteHandler(ingestBroker, ingestQE, ingestMeta); ir != nil {
 		mux.Handle("POST /v1/admin/ingest/remote", ir)
 	}
 	if aq := handler.NewAdminQueryHandler(searcher); aq != nil {

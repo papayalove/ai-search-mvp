@@ -7,6 +7,8 @@ type SearchRequest struct {
 	SourceTypes  []string       `json:"source_types,omitempty"`
 	Filters      map[string]any `json:"filters,omitempty"`
 	RequestID    string         `json:"request_id,omitempty"`
+	// Retrieval hybrid（默认）| milvus | es
+	Retrieval string `json:"retrieval,omitempty"`
 }
 
 // SearchResponse is the JSON envelope returned by POST /v1/search.

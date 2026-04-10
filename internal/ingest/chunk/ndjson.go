@@ -27,6 +27,8 @@ type TextChunkLine struct {
 	TaskID   string `json:"task_id"`
 	// ExtraInfo 原始 JSON 对象（字典）。
 	ExtraInfo json.RawMessage `json:"extra_info"`
+	// CreatedMs/UpdatedMs：行内 Unix 毫秒；均为 0 且无 ts 时用解析时刻的当前时间。
+	// 若需「入库时刻」而非「文件里的时间」，在 pipeline 侧启用 NDJSONRunOptions.UseServerIngestTime 或环境变量 INGEST_USE_SERVER_TIME。
 	CreatedMs int64 `json:"created_time"`
 	UpdatedMs int64 `json:"update_time"`
 }

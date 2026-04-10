@@ -11,10 +11,12 @@ import (
 
 	"ai-search-v1/internal/config"
 	"ai-search-v1/internal/ingest/chunk"
+	ingestmeta "ai-search-v1/internal/ingest/meta"
 	"ai-search-v1/internal/ingest/pipeline"
 	"ai-search-v1/internal/queue"
 	"ai-search-v1/internal/storage/es"
 	"ai-search-v1/internal/storage/milvus"
+	"ai-search-v1/internal/storage/mysqldb"
 	storages3 "ai-search-v1/internal/storage/s3"
 )
 
@@ -130,13 +132,50 @@ func runWorker(apiCfg *config.API, ropts chunk.RecursiveChunkOptions, ensureCol 
 		log.Fatalf("s3 client: %v", err)
 	}
 
+	im := config.LoadIngestMetaFromEnv()
+	if err := mysqldb.Init(im.MySQLDSN); err != nil {
+		log.Fatalf("mysql init: %v", err)
+	}
+	defer func() { _ = mysqldb.CloseGlobal() }()
+	if mysqldb.Repo() != nil {
+		log.Print("mysql: global pool initialized (MYSQL_DSN)")
+	}
+
+	var ingestMeta *ingestmeta.Service
+	if im.Enabled {
+		if mysqldb.Repo() == nil {
+			log.Fatal("ingest meta enabled but MYSQL_DSN is empty or mysql init failed")
+		}
+		var taskIdx *es.IngestTaskIndex
+		if esRepo != nil {
+			taskIdx = es.NewIngestTaskIndex(esRepo, im.TaskESIndex)
+			if err := taskIdx.EnsureIndex(ctx); err != nil {
+				log.Fatalf("ingest meta elasticsearch task index: %v", err)
+			}
+			log.Printf("ingest meta: elasticsearch task index %q ready", im.TaskESIndex)
+		} else {
+			log.Print("ingest meta: elasticsearch disabled; task documents will not be written (MySQL job rows only)")
+		}
+		ingestMeta = ingestmeta.NewService(mysqldb.Repo(), taskIdx)
+		log.Printf("ingest meta: mysql ingest_job enabled (INGEST_ES_TASK_INDEX=%q)", im.TaskESIndex)
+	}
+
 	runner := &pipeline.Runner{
 		Embedder: emb,
 		Repo:     repo,
 		ES:       esRepo,
 		MaxBatch: apiCfg.Embedding.MaxBatch,
 	}
-	worker := &pipeline.JobWorker{Runner: runner, Broker: broker, S3: s3cli}
+	worker := &pipeline.JobWorker{
+		Runner:              runner,
+		Broker:              broker,
+		S3:                  s3cli,
+		Meta:                ingestMeta,
+		UseServerIngestTime: config.LoadIngestUseServerTimeFromEnv(),
+	}
+	if worker.UseServerIngestTime {
+		log.Print("ingest: INGEST_USE_SERVER_TIME=true（NDJSON 行内 created_time/update_time/ts 将被忽略，使用入库时刻）")
+	}
 
 	log.Printf("importer worker listening on redis list %q", qe.QueueListKey)
 	for {
@@ -229,12 +268,17 @@ func runOnce(apiCfg *config.API, ropts chunk.RecursiveChunkOptions, inputPath, p
 	mb := apiCfg.Embedding.MaxBatch
 	runner := &pipeline.Runner{Embedder: emb, Repo: repo, ES: esRepo, MaxBatch: mb}
 
+	useSrv := config.LoadIngestUseServerTimeFromEnv()
+	if useSrv {
+		log.Print("ingest: INGEST_USE_SERVER_TIME=true（NDJSON 行内时间戳忽略，使用入库时刻）")
+	}
 	st, err := runner.RunNDJSON(ctx, f, pipeline.NDJSONRunOptions{
-		Partition:   partition,
-		Upsert:      upsert,
-		ChunkExpand: chunkExpand,
-		ChunkOpts:   ropts,
-		Flush:       !noFlush,
+		Partition:           partition,
+		Upsert:              upsert,
+		ChunkExpand:         chunkExpand,
+		ChunkOpts:           ropts,
+		Flush:               !noFlush,
+		UseServerIngestTime: useSrv,
 	})
 	if err != nil {
 		log.Fatal(err)
