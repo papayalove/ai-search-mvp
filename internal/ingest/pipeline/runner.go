@@ -41,8 +41,6 @@ type NDJSONRunOptions struct {
 	// JobID/TaskID 写入 Milvus/ES；行内非空时覆盖。
 	JobID  string
 	TaskID string
-	// UseServerIngestTime 为 true 时忽略行内 created_time/update_time/ts，统一用当前时间写入 Milvus/ES。
-	UseServerIngestTime bool
 }
 
 // PlainRunOptions 控制单个纯文本文件（txt/md）导入。
@@ -142,12 +140,10 @@ func (r *Runner) RunNDJSON(ctx context.Context, input io.Reader, opt NDJSONRunOp
 		}
 		for _, row := range rows {
 			r := row
-			if opt.UseServerIngestTime {
-				now := time.Now().UnixMilli()
-				r.CreatedMs = now
-				r.UpdatedMs = now
-				r.TsLegacy = 0
-			}
+			now := time.Now().UnixMilli()
+			r.CreatedMs = now
+			r.UpdatedMs = now
+			r.TsLegacy = 0
 			pending = append(pending, r)
 			if len(pending) >= batch {
 				if err := flush(); err != nil {

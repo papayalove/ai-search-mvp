@@ -166,16 +166,7 @@ func runWorker(apiCfg *config.API, ropts chunk.RecursiveChunkOptions, ensureCol 
 		ES:       esRepo,
 		MaxBatch: apiCfg.Embedding.MaxBatch,
 	}
-	worker := &pipeline.JobWorker{
-		Runner:              runner,
-		Broker:              broker,
-		S3:                  s3cli,
-		Meta:                ingestMeta,
-		UseServerIngestTime: config.LoadIngestUseServerTimeFromEnv(),
-	}
-	if worker.UseServerIngestTime {
-		log.Print("ingest: INGEST_USE_SERVER_TIME=true（NDJSON 行内 created_time/update_time/ts 将被忽略，使用入库时刻）")
-	}
+	worker := &pipeline.JobWorker{Runner: runner, Broker: broker, S3: s3cli, Meta: ingestMeta}
 
 	log.Printf("importer worker listening on redis list %q", qe.QueueListKey)
 	for {
@@ -268,17 +259,12 @@ func runOnce(apiCfg *config.API, ropts chunk.RecursiveChunkOptions, inputPath, p
 	mb := apiCfg.Embedding.MaxBatch
 	runner := &pipeline.Runner{Embedder: emb, Repo: repo, ES: esRepo, MaxBatch: mb}
 
-	useSrv := config.LoadIngestUseServerTimeFromEnv()
-	if useSrv {
-		log.Print("ingest: INGEST_USE_SERVER_TIME=true（NDJSON 行内时间戳忽略，使用入库时刻）")
-	}
 	st, err := runner.RunNDJSON(ctx, f, pipeline.NDJSONRunOptions{
-		Partition:           partition,
-		Upsert:              upsert,
-		ChunkExpand:         chunkExpand,
-		ChunkOpts:           ropts,
-		Flush:               !noFlush,
-		UseServerIngestTime: useSrv,
+		Partition:   partition,
+		Upsert:      upsert,
+		ChunkExpand: chunkExpand,
+		ChunkOpts:   ropts,
+		Flush:       !noFlush,
 	})
 	if err != nil {
 		log.Fatal(err)

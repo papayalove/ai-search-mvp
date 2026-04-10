@@ -21,14 +21,13 @@ type TextChunkLine struct {
 	EntityKeys []string `json:"entity_keys"`
 	SourceType string `json:"source_type"`
 	Lang       string `json:"lang"`
-	// 兼容旧字段 ts（毫秒）；若仅有 ts 则同时填 CreatedMs/UpdatedMs。
+	// TsLegacy 仅反序列化兼容；写入 Milvus/ES 前由 pipeline 统一改为入库时刻。
 	TsLegacy int64 `json:"ts"`
 	JobID    string `json:"job_id"`
 	TaskID   string `json:"task_id"`
 	// ExtraInfo 原始 JSON 对象（字典）。
 	ExtraInfo json.RawMessage `json:"extra_info"`
-	// CreatedMs/UpdatedMs：行内 Unix 毫秒；均为 0 且无 ts 时用解析时刻的当前时间。
-	// 若需「入库时刻」而非「文件里的时间」，在 pipeline 侧启用 NDJSONRunOptions.UseServerIngestTime 或环境变量 INGEST_USE_SERVER_TIME。
+	// CreatedMs/UpdatedMs：JSON 可带 created_time/update_time，但入库时由 pipeline 覆盖为当前时刻（见 RunNDJSON）。
 	CreatedMs int64 `json:"created_time"`
 	UpdatedMs int64 `json:"update_time"`
 }
@@ -78,17 +77,11 @@ func ParseTextChunkLine(line []byte) (TextChunkLine, error) {
 	if r.Lang == "" {
 		r.Lang = "und"
 	}
+	// 解析阶段占位；真实写入前 RunNDJSON 会再次设为入库时刻。行内 ts/时间字段不参与存储。
+	r.TsLegacy = 0
 	now := time.Now().UnixMilli()
-	if r.CreatedMs == 0 && r.UpdatedMs == 0 && r.TsLegacy != 0 {
-		r.CreatedMs = r.TsLegacy
-		r.UpdatedMs = r.TsLegacy
-	}
-	if r.CreatedMs == 0 {
-		r.CreatedMs = now
-	}
-	if r.UpdatedMs == 0 {
-		r.UpdatedMs = r.CreatedMs
-	}
+	r.CreatedMs = now
+	r.UpdatedMs = now
 	if len(bytes.TrimSpace(r.ExtraInfo)) == 0 {
 		r.ExtraInfo = nil
 	}

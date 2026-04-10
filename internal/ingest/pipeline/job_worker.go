@@ -20,8 +20,6 @@ type JobWorker struct {
 	Broker *queue.RedisBroker
 	S3     *storages3.Client
 	Meta   *ingestmeta.Service
-	// UseServerIngestTime 为 true 时 NDJSON 行内时间戳被忽略，见 NDJSONRunOptions.UseServerIngestTime。
-	UseServerIngestTime bool
 }
 
 // ProcessJob 执行单条入库任务（末尾 Flush 一次）。
@@ -43,14 +41,13 @@ func (w *JobWorker) ProcessJob(ctx context.Context, j queue.Job, co chunk.Recurs
 		}()
 	}
 	base := NDJSONRunOptions{
-		Partition:           strings.TrimSpace(j.Partition),
-		Upsert:              j.Upsert,
-		ChunkExpand:         j.ChunkExpand,
-		ChunkOpts:           co,
-		Flush:               false,
-		JobID:               strings.TrimSpace(j.JobID),
-		TaskID:              strings.TrimSpace(j.TaskID),
-		UseServerIngestTime: w.UseServerIngestTime,
+		Partition:   strings.TrimSpace(j.Partition),
+		Upsert:      j.Upsert,
+		ChunkExpand: j.ChunkExpand,
+		ChunkOpts:   co,
+		Flush:       false,
+		JobID:       strings.TrimSpace(j.JobID),
+		TaskID:      strings.TrimSpace(j.TaskID),
 	}
 	switch j.PayloadKind {
 	case queue.PayloadKindMultipartRedis:
