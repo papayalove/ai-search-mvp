@@ -10,7 +10,11 @@ import (
 const (
 	FieldChunkID      = "chunk_id"
 	FieldDocID        = "doc_id"
+	FieldTitle        = "title"
+	FieldURL          = "url"
 	FieldEmbedding    = "embedding"
+	FieldOffset       = "offset"  // 当前 page 内字节起始位置
+	FieldPageNo       = "page_no" // 页号，默认 0
 	FieldSourceType   = "source_type"
 	FieldLang         = "lang"
 	FieldJobID        = "job_id"
@@ -46,6 +50,14 @@ func collectionSchema(cfg Config) (*entity.Schema, error) {
 	if exLen <= 0 {
 		exLen = defaultMaxExtraInfoLen
 	}
+	titleLen := int64(cfg.MaxTitleLen)
+	if titleLen <= 0 {
+		titleLen = defaultMaxTitleLen
+	}
+	urlLen := int64(cfg.MaxURLLen)
+	if urlLen <= 0 {
+		urlLen = defaultMaxURLLen
+	}
 	return entity.NewSchema().
 		WithName(cfg.Collection).
 		WithDescription("chunk-level vectors for semantic search MVP").
@@ -67,9 +79,31 @@ func collectionSchema(cfg Config) (*entity.Schema, error) {
 		).
 		WithField(
 			entity.NewField().
+				WithName(FieldTitle).
+				WithDataType(entity.FieldTypeVarChar).
+				WithMaxLength(titleLen),
+		).
+		WithField(
+			entity.NewField().
+				WithName(FieldURL).
+				WithDataType(entity.FieldTypeVarChar).
+				WithMaxLength(urlLen),
+		).
+		WithField(
+			entity.NewField().
 				WithName(FieldEmbedding).
 				WithDataType(entity.FieldTypeFloatVector).
 				WithDim(int64(cfg.VectorDim)),
+		).
+		WithField(
+			entity.NewField().
+				WithName(FieldOffset).
+				WithDataType(entity.FieldTypeInt64),
+		).
+		WithField(
+			entity.NewField().
+				WithName(FieldPageNo).
+				WithDataType(entity.FieldTypeInt64),
 		).
 		WithField(
 			entity.NewField().

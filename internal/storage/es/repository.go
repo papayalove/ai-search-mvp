@@ -111,6 +111,8 @@ func (r *Repository) EnsureIndex(ctx context.Context) error {
 				"extra_info":   map[string]any{"type": "object", "dynamic": true},
 				"created_time": map[string]string{"type": "date"},
 				"update_time":  map[string]string{"type": "date"},
+				"offset":       map[string]string{"type": "long"},
+				"page_no":      map[string]string{"type": "integer"},
 			},
 		},
 	}
@@ -169,6 +171,8 @@ type chunkIndexSource struct {
 	ExtraInfo   map[string]any `json:"extra_info,omitempty"`
 	CreatedTime string         `json:"created_time"`
 	UpdatedTime string         `json:"update_time"`
+	Offset      int64          `json:"offset,omitempty"`
+	PageNo      int64          `json:"page_no,omitempty"`
 }
 
 // BulkIndexChunkDocs 使用 _bulk 按 chunk_id 索引文档（_id = chunk_id）；同一 chunk 再次写入则覆盖该文档。
@@ -216,6 +220,8 @@ func (r *Repository) BulkIndexChunkDocs(ctx context.Context, docs []ChunkEntityD
 			ExtraInfo:   ex,
 			CreatedTime: ct.UTC().Format(time.RFC3339Nano),
 			UpdatedTime: ut.UTC().Format(time.RFC3339Nano),
+			Offset:      d.Offset,
+			PageNo:      d.PageNo,
 		}
 		if err := enc.Encode(src); err != nil {
 			return err
@@ -344,6 +350,8 @@ func (r *Repository) SearchByEntityKeys(ctx context.Context, keys []string, size
 					TaskID      string   `json:"task_id"`
 					CreatedTime string   `json:"created_time"`
 					UpdateTime  string   `json:"update_time"`
+					Offset      int64    `json:"offset"`
+					PageNo      int64    `json:"page_no"`
 				} `json:"_source"`
 			} `json:"hits"`
 		} `json:"hits"`
@@ -383,6 +391,8 @@ func (r *Repository) SearchByEntityKeys(ctx context.Context, keys []string, size
 			Score:       h.Score,
 			CreatedTime: ct,
 			UpdatedTime: ut,
+			Offset:      h.Source.Offset,
+			PageNo:      h.Source.PageNo,
 		})
 		if len(out) >= size {
 			break

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"ai-search-v1/internal/query"
 	"ai-search-v1/internal/storage/es"
 )
 
@@ -36,16 +37,20 @@ func RecallES(ctx context.Context, repo *es.Repository, keys []string, topK int)
 		if ct <= 0 {
 			ct = ut
 		}
+		doc := strings.TrimSpace(h.DocID)
 		out = append(out, Hit{
 			ChunkID:      cid,
-			DocID:        strings.TrimSpace(h.DocID),
+			DocID:        doc,
 			SourceType:   strings.TrimSpace(h.SourceType),
 			Lang:         strings.TrimSpace(h.Lang),
 			Ts:           ut,
 			CreatedTs:    ct,
 			Score:        h.Score,
-			URLOrDocID:   strings.TrimSpace(h.DocID),
+			URLOrDocID:   doc,
 			Title:        cid,
+			Offset:       h.Offset,
+			PageNo:       int(h.PageNo),
+			Source:       query.ContentFetchSource("", doc),
 			RecallSource: "es",
 		})
 	}

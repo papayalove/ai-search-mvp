@@ -30,6 +30,10 @@ func MergeDedupeMilvusFirst(milvusHits, esHits []Hit, topK int) []Hit {
 		}
 		if i, ok := idxByChunk[h.ChunkID]; ok {
 			out[i].RecallSource = "both"
+			// 以 Milvus 为主；仅当 Milvus 未解析出可拉取源时，用 ES 的 doc_id/url 补 Source（offset=0 为合法值，不能用 0 判断「未设置」）。
+			if out[i].Source == "" && h.Source != "" {
+				out[i].Source = h.Source
+			}
 			continue
 		}
 		h2 := h

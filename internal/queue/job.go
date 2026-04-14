@@ -23,12 +23,13 @@ type Job struct {
 	JobID       string    `json:"job_id"`
 	JobName     string    `json:"job_name,omitempty"`
 	PayloadKind string    `json:"payload_kind"`
-	Partition   string    `json:"partition,omitempty"`
-	Upsert      bool      `json:"upsert"`
-	ChunkExpand bool      `json:"chunk_expand"`
-	SourceType  string    `json:"source_type,omitempty"`
+	Partition  string `json:"partition,omitempty"`
+	Upsert     bool   `json:"upsert"`
+	SourceType string `json:"source_type,omitempty"`
 	Lang        string    `json:"lang,omitempty"`
 	DocID       string    `json:"doc_id,omitempty"`
+	Title       string    `json:"title,omitempty"`
+	URL         string    `json:"url,omitempty"`
 	PageNo      int       `json:"page_no"`
 	ChunkID     string    `json:"chunk_id,omitempty"`
 	TaskID      string    `json:"task_id,omitempty"`

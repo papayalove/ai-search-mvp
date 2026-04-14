@@ -10,3 +10,5 @@
 
 # 前端（独立仓库，避免与根仓库嵌套冲突）
 web/heroic-web3-gateway/
+
+test/

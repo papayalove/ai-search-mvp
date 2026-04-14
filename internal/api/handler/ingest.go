@@ -54,12 +54,13 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	partition := strings.TrimSpace(r.FormValue("partition"))
-	upsert := formBool(r.FormValue("upsert"))
-	chunkExpand := formBool(r.FormValue("chunk"))
+	upsert := ingestUpsertFromForm(r.FormValue("upsert"))
 	sourceType := strings.TrimSpace(r.FormValue("source_type"))
 	lang := strings.TrimSpace(r.FormValue("lang"))
 	chunkIDForm := strings.TrimSpace(r.FormValue("chunk_id"))
 	docID := strings.TrimSpace(r.FormValue("doc_id"))
+	title := strings.TrimSpace(r.FormValue("title"))
+	url := strings.TrimSpace(r.FormValue("url"))
 	taskID := strings.TrimSpace(r.FormValue("task_id"))
 	jobName := strings.TrimSpace(r.FormValue("job_name"))
 	if jobName == "" {
@@ -90,9 +91,9 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for i, fh := range headers {
 		ext := strings.ToLower(strings.TrimSpace(filepath.Ext(fh.Filename)))
 		switch ext {
-		case ".ndjson", ".jsonl", ".txt", ".md", ".markdown":
+		case ".ndjson", ".jsonl", ".json", ".txt", ".md", ".markdown":
 		default:
-			writeJSON(w, http.StatusBadRequest, errBody("unsupported_type", fmt.Sprintf("file %q: use .ndjson, .jsonl, .txt, .md", fh.Filename)))
+			writeJSON(w, http.StatusBadRequest, errBody("unsupported_type", fmt.Sprintf("file %q: use .ndjson, .jsonl, .json, .txt, .md", fh.Filename)))
 			return
 		}
 		f, err := fh.Open()
@@ -131,10 +132,11 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		PayloadKind: queue.PayloadKindMultipartRedis,
 		Partition:   partition,
 		Upsert:      upsert,
-		ChunkExpand: chunkExpand,
 		SourceType:  sourceType,
 		Lang:        lang,
 		DocID:       docID,
+		Title:       title,
+		URL:         url,
 		PageNo:      pageNo,
 		ChunkID:     chunkIDForm,
 		TaskID:      taskID,
@@ -167,4 +169,16 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func formBool(s string) bool {
 	s = strings.TrimSpace(strings.ToLower(s))
 	return s == "1" || s == "true" || s == "yes" || s == "on"
+}
+
+// ingestUpsertFromForm 未传或空时默认 Upsert（true）；显式 "false"/"0"/"no"/"off" 为 Insert。
+func ingestUpsertFromForm(s string) bool {
+	v := strings.TrimSpace(strings.ToLower(s))
+	if v == "" {
+		return true
+	}
+	if v == "0" || v == "false" || v == "no" || v == "off" {
+		return false
+	}
+	return formBool(s)
 }

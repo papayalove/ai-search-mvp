@@ -33,25 +33,31 @@ type Runner struct {
 
 // NDJSONRunOptions 控制 NDJSON 流式导入行为。
 type NDJSONRunOptions struct {
-	Partition   string
-	Upsert      bool
-	ChunkExpand bool
-	ChunkOpts   chunk.RecursiveChunkOptions
+	Partition string
+	Upsert    bool
+	ChunkOpts chunk.RecursiveChunkOptions
 	Flush       bool
 	// JobID/TaskID 写入 Milvus/ES；行内非空时覆盖。
 	JobID  string
 	TaskID string
+	// FileExt 当前输入文件扩展名（如 ".ndjson"），行内未写 source_type 时参与 EffectiveIngestSourceType。
+	FileExt string
+	// JobSourceType 任务级表单 source_type；仅在行内未写 source_type 且 FileExt 无法推断时使用。
+	JobSourceType string
 }
 
 // PlainRunOptions 控制单个纯文本文件（txt/md）导入。
 type PlainRunOptions struct {
-	ChunkID     string
-	DocID       string
-	PageNo      int
-	SourceType  string
-	Lang        string
-	ChunkExpand bool
-	ChunkOpts   chunk.RecursiveChunkOptions
+	ChunkID    string
+	DocID      string
+	Title      string
+	URL        string
+	PageNo     int
+	// OffsetBase 整段 text 在「当前 page」内的起始字节（通常为 0）；与切分后的相对 offset 相加写入 Milvus。
+	OffsetBase int64
+	SourceType string
+	Lang       string
+	ChunkOpts  chunk.RecursiveChunkOptions
 	Partition   string
 	Upsert      bool
 	Flush       bool
@@ -66,7 +72,8 @@ type RunStats struct {
 }
 
 // PreviewNDJSON 仅解析与分块统计，不连 Milvus、不嵌入（供 importer -dry-run）。
-func PreviewNDJSON(input io.Reader, chunkExpand bool, opts chunk.RecursiveChunkOptions) (inputLines, chunkRows int, err error) {
+// fileExt / jobSourceType 与 RunNDJSON 一致，用于行内缺省 source_type 时的推断（可皆为空）。
+func PreviewNDJSON(input io.Reader, opts chunk.RecursiveChunkOptions, fileExt, jobSourceType string) (inputLines, chunkRows int, err error) {
 	sc := bufio.NewScanner(input)
 	buf := make([]byte, 0, 64*1024)
 	sc.Buffer(buf, 16*1024*1024)
@@ -79,16 +86,15 @@ func PreviewNDJSON(input io.Reader, chunkExpand bool, opts chunk.RecursiveChunkO
 		if perr != nil {
 			return inputLines, chunkRows, fmt.Errorf("line %d: %w", inputLines+1, perr)
 		}
-		inputLines++
-		if chunkExpand {
-			rows, serr := chunk.SplitRecord(rec, opts)
-			if serr != nil {
-				return inputLines, chunkRows, fmt.Errorf("line %d chunk: %w", inputLines, serr)
-			}
-			chunkRows += len(rows)
-		} else {
-			chunkRows++
+		if strings.TrimSpace(rec.SourceType) == "" {
+			rec.SourceType = EffectiveIngestSourceType(fileExt, jobSourceType)
 		}
+		inputLines++
+		rows, serr := chunk.SplitRecord(rec, opts)
+		if serr != nil {
+			return inputLines, chunkRows, fmt.Errorf("line %d chunk: %w", inputLines, serr)
+		}
+		chunkRows += len(rows)
 	}
 	if err := sc.Err(); err != nil {
 		return inputLines, chunkRows, err
@@ -96,7 +102,7 @@ func PreviewNDJSON(input io.Reader, chunkExpand bool, opts chunk.RecursiveChunkO
 	return inputLines, chunkRows, nil
 }
 
-// RunNDJSON 按行读取 NDJSON，可选递归分块后嵌入并写入 Milvus。
+// RunNDJSON 按行读取 NDJSON，每行经 RecursiveChunkOptions 切分后嵌入并写入 Milvus。
 func (r *Runner) RunNDJSON(ctx context.Context, input io.Reader, opt NDJSONRunOptions) (RunStats, error) {
 	if err := r.validate(); err != nil {
 		return RunStats{}, err
@@ -128,15 +134,13 @@ func (r *Runner) RunNDJSON(ctx context.Context, input io.Reader, opt NDJSONRunOp
 		if err != nil {
 			return st, fmt.Errorf("line %d: %w", st.InputLines+1, err)
 		}
+		if strings.TrimSpace(rec.SourceType) == "" {
+			rec.SourceType = EffectiveIngestSourceType(opt.FileExt, opt.JobSourceType)
+		}
 		st.InputLines++
-		var rows []chunk.TextChunkLine
-		if opt.ChunkExpand {
-			rows, err = chunk.SplitRecord(rec, opt.ChunkOpts)
-			if err != nil {
-				return st, fmt.Errorf("line %d chunk: %w", st.InputLines, err)
-			}
-		} else {
-			rows = []chunk.TextChunkLine{rec}
+		rows, err := chunk.SplitRecord(rec, opt.ChunkOpts)
+		if err != nil {
+			return st, fmt.Errorf("line %d chunk: %w", st.InputLines, err)
 		}
 		for _, row := range rows {
 			r := row
@@ -166,7 +170,7 @@ func (r *Runner) RunNDJSON(ctx context.Context, input io.Reader, opt NDJSONRunOp
 	return st, nil
 }
 
-// RunPlain 将整段文本作为一条逻辑文档导入（可选再递归分块）。
+// RunPlain 将整段文本作为一条逻辑文档导入，再按 RecursiveChunkOptions 切分后嵌入。
 func (r *Runner) RunPlain(ctx context.Context, text string, opt PlainRunOptions) (RunStats, error) {
 	if err := r.validate(); err != nil {
 		return RunStats{}, err
@@ -197,11 +201,22 @@ func (r *Runner) RunPlain(ctx context.Context, text string, opt PlainRunOptions)
 		lang = "und"
 	}
 	now := time.Now().UnixMilli()
+	pn := opt.PageNo
+	if pn < 0 {
+		pn = 0
+	}
+	offBase := opt.OffsetBase
+	if offBase < 0 {
+		offBase = 0
+	}
 	rec := chunk.TextChunkLine{
 		ChunkID:    id,
 		Text:       text,
 		DocID:      docID,
-		PageNo:     opt.PageNo,
+		Title:      strings.TrimSpace(opt.Title),
+		URL:        strings.TrimSpace(opt.URL),
+		PageNo:     pn,
+		Offset:     offBase,
 		ChunkNo:    0,
 		SourceType: src,
 		Lang:       lang,
@@ -210,13 +225,7 @@ func (r *Runner) RunPlain(ctx context.Context, text string, opt PlainRunOptions)
 		JobID:      strings.TrimSpace(opt.JobID),
 		TaskID:     strings.TrimSpace(opt.TaskID),
 	}
-	var rows []chunk.TextChunkLine
-	var err error
-	if opt.ChunkExpand {
-		rows, err = chunk.SplitRecord(rec, opt.ChunkOpts)
-	} else {
-		rows = []chunk.TextChunkLine{rec}
-	}
+	rows, err := chunk.SplitRecord(rec, opt.ChunkOpts)
 	if err != nil {
 		return RunStats{}, err
 	}
@@ -303,9 +312,15 @@ func (r *Runner) writeBatch(ctx context.Context, partition string, upsert bool, 
 		if tid == "" {
 			tid = strings.TrimSpace(defaultTaskID)
 		}
+		pn := int64(batch[i].PageNo)
+		if pn < 0 {
+			pn = 0
+		}
 		rows[i] = milvus.ChunkEntity{
 			ChunkID:       batch[i].ChunkID,
 			DocID:         strings.TrimSpace(batch[i].DocID),
+			Title:         strings.TrimSpace(batch[i].Title),
+			URL:           strings.TrimSpace(batch[i].URL),
 			Embedding:     vecs[i],
 			SourceType:    batch[i].SourceType,
 			Lang:          batch[i].Lang,
@@ -314,6 +329,8 @@ func (r *Runner) writeBatch(ctx context.Context, partition string, upsert bool, 
 			ExtraInfoJSON: extraInfoJSONString(batch[i].ExtraInfo),
 			CreatedTime:   batch[i].CreatedMs,
 			UpdatedTime:   batch[i].UpdatedMs,
+			Offset:        batch[i].Offset,
+			PageNo:        pn,
 		}
 	}
 	if upsert {
@@ -365,6 +382,9 @@ func entityChunkDocsFromBatch(batch []chunk.TextChunkLine, defaultJobID, default
 		jobID       string
 		taskID      string
 		extra       map[string]any
+		offset      int64
+		pageNo      int64
+		hasOffset   bool
 	}
 	byChunk := make(map[string]*acc)
 	for i := range batch {
@@ -402,6 +422,9 @@ func entityChunkDocsFromBatch(batch []chunk.TextChunkLine, defaultJobID, default
 			a.createdMs = row.CreatedMs
 			a.jobID = jid
 			a.taskID = tid
+			a.offset = row.Offset
+			a.pageNo = int64(row.PageNo)
+			a.hasOffset = true
 			for k, v := range rowExtra {
 				a.extra[k] = v
 			}
@@ -415,6 +438,13 @@ func entityChunkDocsFromBatch(batch []chunk.TextChunkLine, defaultJobID, default
 			}
 			if row.CreatedMs < a.createdMs || a.createdMs == 0 {
 				a.createdMs = row.CreatedMs
+			}
+			if a.hasOffset && row.Offset < a.offset {
+				a.offset = row.Offset
+			}
+			pn := int64(row.PageNo)
+			if pn < a.pageNo {
+				a.pageNo = pn
 			}
 			for k, v := range rowExtra {
 				a.extra[k] = v
@@ -451,6 +481,8 @@ func entityChunkDocsFromBatch(batch []chunk.TextChunkLine, defaultJobID, default
 			ExtraInfo:   a.extra,
 			CreatedTime: time.UnixMilli(a.createdMs),
 			UpdatedTime: time.UnixMilli(a.updatedMs),
+			Offset:      a.offset,
+			PageNo:      a.pageNo,
 		})
 	}
 	return out, nil

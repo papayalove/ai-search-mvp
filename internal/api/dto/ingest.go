@@ -36,14 +36,16 @@ type IngestRemoteRequest struct {
 	Keys        []string `json:"keys"`
 	Prefix      string   `json:"prefix"`
 	SourceURL   string   `json:"source_url"`
-	Partition   string   `json:"partition"`
-	Upsert      bool     `json:"upsert"`
-	ChunkExpand bool     `json:"chunk_expand"`
-	SourceType  string   `json:"source_type"`
-	Lang        string   `json:"lang"`
-	DocID       string   `json:"doc_id"`
-	PageNo      int      `json:"page_no"`
-	TaskID      string   `json:"task_id"`
+	Partition  string `json:"partition"`
+	// Upsert 省略或为 null 时由 API 默认为 true（Milvus Upsert）；显式 false 则 Insert。
+	Upsert *bool `json:"upsert,omitempty"`
+	SourceType string `json:"source_type"`
+	Lang       string `json:"lang"`
+	DocID      string `json:"doc_id"`
+	Title      string `json:"title,omitempty"`
+	URL        string `json:"url,omitempty"`
+	PageNo     int    `json:"page_no"`
+	TaskID     string `json:"task_id"`
 }
 
 // IngestRemoteResponse 202。

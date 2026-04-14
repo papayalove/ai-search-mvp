@@ -24,7 +24,7 @@ func (a *API) BuildEmbedder() (embedding.Embedder, error) {
 		return embedding.NewHTTPEmbedder(opt)
 	case "local", "file", "onnx":
 		return nil, fmt.Errorf(
-			"embedding backend %q is not supported; use embedding.backend: http in configs/api.yaml and set EMBEDDING_SOURCE=remote (远程 API) or self_hosted (自建 python embedding-service)", b)
+			"embedding backend %q is not supported; use embedding.backend: http in configs/api.yaml and set EMBEDDING_SOURCE=remote (远程 API) or self_hosted (自建 model_services/embedding-service)", b)
 	default:
 		return nil, fmt.Errorf("embedding backend %q: use http with EMBEDDING_SOURCE=remote or self_hosted", b)
 	}
@@ -125,29 +125,26 @@ func (e EmbeddingConfig) ToHTTPEmbedderOptions() (embedding.Options, error) {
 	}
 
 	endpoint := strings.TrimSpace(e.Endpoint)
-	if v := strings.TrimSpace(os.Getenv("EMBEDDING_ENDPOINT")); v != "" {
-		endpoint = v
-	} else {
-		switch src {
-		case "self_hosted", "local_service", "python":
-			host := strings.TrimSpace(os.Getenv("EMBEDDING_LOCAL_HTTP_HOST"))
-			if host == "" {
-				host = "127.0.0.1"
-			}
-			// 0.0.0.0 / :: 仅适合 bind，HTTP 客户端必须连本机回环（Windows 否则 WinError 10049）
-			if host == "0.0.0.0" || host == "::" {
-				host = "127.0.0.1"
-			}
-			port := strings.TrimSpace(os.Getenv("EMBEDDING_LOCAL_HTTP_PORT"))
-			if port == "" {
-				port = "3888"
-			}
-			endpoint = fmt.Sprintf("http://%s:%s/v1/embeddings", host, port)
-		default:
-			if base := strings.TrimSpace(os.Getenv("EMBEDDING_API_BASE_URL")); base != "" {
-				base = strings.TrimRight(base, "/")
-				endpoint = base + "/v1/embeddings"
-			}
+	switch src {
+	case "self_hosted", "local_service", "python":
+		host := strings.TrimSpace(os.Getenv("EMBEDDING_LOCAL_HTTP_HOST"))
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		// 0.0.0.0 / :: 仅适合 bind，HTTP 客户端必须连本机回环（Windows 否则 WinError 10049）
+		if host == "0.0.0.0" || host == "::" {
+			host = "127.0.0.1"
+		}
+		port := strings.TrimSpace(os.Getenv("EMBEDDING_LOCAL_HTTP_PORT"))
+		if port == "" {
+			port = "3888"
+		}
+		endpoint = fmt.Sprintf("http://%s:%s/v1/embeddings", host, port)
+	default:
+		// remote：仅 EMBEDDING_API_BASE_URL（不含 path），与 OpenAI 兼容路径拼为 .../v1/embeddings；未设时沿用 yaml embedding.endpoint
+		if base := strings.TrimSpace(os.Getenv("EMBEDDING_API_BASE_URL")); base != "" {
+			base = strings.TrimRight(base, "/")
+			endpoint = base + "/v1/embeddings"
 		}
 	}
 

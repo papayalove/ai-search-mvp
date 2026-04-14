@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -12,7 +14,11 @@ import (
 	"ai-search-v1/internal/ingest/meta"
 	"ai-search-v1/internal/queue"
 	storages3 "ai-search-v1/internal/storage/s3"
+	"ai-search-v1/pkg/util"
 )
+
+// maxS3ObjectBody 与 admin multipart 单文件上限一致，避免单对象撑爆内存。
+const maxS3ObjectBody = 32 << 20
 
 // JobWorker 消费 queue.Job：multipart 从 Redis 取正文；S3 从对象存储流式读取。
 type JobWorker struct {
@@ -27,27 +33,33 @@ func (w *JobWorker) ProcessJob(ctx context.Context, j queue.Job, co chunk.Recurs
 	if w == nil || w.Runner == nil {
 		return fmt.Errorf("job worker: nil runner")
 	}
+	j.JobID = strings.TrimSpace(j.JobID)
 	metaOn := w.Meta != nil && w.Meta.Enabled()
 	if metaOn {
 		if err := w.Meta.OnWorkerJobStart(ctx, j.JobID); err != nil {
+			log.Printf("ingest meta: OnWorkerJobStart job_id=%s: %v", j.JobID, err)
 			return err
 		}
 		defer func() {
 			if err != nil {
-				_ = w.Meta.OnWorkerJobFailed(ctx, j.JobID, err)
+				if e := w.Meta.OnWorkerJobFailed(ctx, j.JobID, err); e != nil {
+					log.Printf("ingest meta: OnWorkerJobFailed job_id=%s: %v", j.JobID, e)
+				}
 			} else {
-				_ = w.Meta.OnWorkerJobSucceeded(ctx, j.JobID)
+				if e := w.Meta.OnWorkerJobSucceeded(ctx, j.JobID); e != nil {
+					log.Printf("ingest meta: OnWorkerJobSucceeded job_id=%s: %v", j.JobID, e)
+				}
 			}
 		}()
 	}
 	base := NDJSONRunOptions{
-		Partition:   strings.TrimSpace(j.Partition),
-		Upsert:      j.Upsert,
-		ChunkExpand: j.ChunkExpand,
-		ChunkOpts:   co,
-		Flush:       false,
-		JobID:       strings.TrimSpace(j.JobID),
-		TaskID:      strings.TrimSpace(j.TaskID),
+		Partition:     strings.TrimSpace(j.Partition),
+		Upsert:        j.Upsert,
+		ChunkOpts:     co,
+		Flush:         false,
+		JobID:         strings.TrimSpace(j.JobID),
+		TaskID:        strings.TrimSpace(j.TaskID),
+		JobSourceType: strings.TrimSpace(j.SourceType),
 	}
 	switch j.PayloadKind {
 	case queue.PayloadKindMultipartRedis:
@@ -92,27 +104,32 @@ func (w *JobWorker) processMultipart(ctx context.Context, j queue.Job, base NDJS
 		}
 		ext := strings.ToLower(strings.TrimSpace(filepath.Ext(f.Filename)))
 		plain := PlainRunOptions{
-			Partition:   base.Partition,
-			Upsert:      base.Upsert,
-			ChunkExpand: base.ChunkExpand,
-			ChunkOpts:   base.ChunkOpts,
-			Flush:       false,
-			JobID:       base.JobID,
-			TaskID:      taskID,
-			SourceType:  strings.TrimSpace(j.SourceType),
-			Lang:        strings.TrimSpace(j.Lang),
-			DocID:       strings.TrimSpace(j.DocID),
-			PageNo:      j.PageNo,
+			Partition:  base.Partition,
+			Upsert:     base.Upsert,
+			ChunkOpts:  base.ChunkOpts,
+			Flush:      false,
+			JobID:      base.JobID,
+			TaskID:     taskID,
+			SourceType: EffectiveIngestSourceType(ext, j.SourceType),
+			Lang:       strings.TrimSpace(j.Lang),
+			DocID:      strings.TrimSpace(j.DocID),
+			Title:      strings.TrimSpace(j.Title),
+			URL:        strings.TrimSpace(j.URL),
+			PageNo:     j.PageNo,
 		}
 		var st RunStats
 		var runErr error
 		switch ext {
-		case ".ndjson", ".jsonl":
+		case ".ndjson", ".jsonl", ".json":
 			opt := base
 			opt.TaskID = taskID
+			opt.FileExt = ext
 			st, runErr = w.Runner.RunNDJSON(ctx, bytes.NewReader(body), opt)
 		case ".txt", ".md", ".markdown":
 			plain.ChunkID = strings.TrimSpace(j.ChunkID)
+			if plain.Title == "" {
+				plain.Title = filepath.Base(f.Filename)
+			}
 			st, runErr = w.Runner.RunPlain(ctx, string(body), plain)
 		default:
 			runErr = fmt.Errorf("unsupported file type %q", ext)
@@ -210,22 +227,75 @@ func (w *JobWorker) processS3(ctx context.Context, j queue.Job, base NDJSONRunOp
 			}
 			return fmt.Errorf("s3 get %s/%s: %w", bucket, key, err)
 		}
+		body, rerr := io.ReadAll(io.LimitReader(rc, maxS3ObjectBody+1))
+		_ = rc.Close()
+		if rerr != nil {
+			if metaOn {
+				if e := w.Meta.OnTaskFailed(ctx, j.JobID, tid, rerr); e != nil {
+					return e
+				}
+			}
+			return fmt.Errorf("s3 read %s/%s: %w", bucket, key, rerr)
+		}
+		if len(body) > maxS3ObjectBody {
+			tooBig := fmt.Errorf("object exceeds %d bytes", maxS3ObjectBody)
+			if metaOn {
+				if e := w.Meta.OnTaskFailed(ctx, j.JobID, tid, tooBig); e != nil {
+					return e
+				}
+			}
+			return fmt.Errorf("s3 %s/%s: %w", bucket, key, tooBig)
+		}
+
 		opt := base
 		opt.TaskID = tid
-		st, err := w.Runner.RunNDJSON(ctx, rc, opt)
-		_ = rc.Close()
+		ext := strings.ToLower(strings.TrimSpace(filepath.Ext(key)))
+		plain := PlainRunOptions{
+			Partition:  base.Partition,
+			Upsert:     base.Upsert,
+			ChunkOpts:  base.ChunkOpts,
+			Flush:      false,
+			JobID:      base.JobID,
+			TaskID:     tid,
+			SourceType: EffectiveIngestSourceType(ext, j.SourceType),
+			Lang:       strings.TrimSpace(j.Lang),
+			DocID:      strings.TrimSpace(j.DocID),
+			Title:      strings.TrimSpace(j.Title),
+			URL:        strings.TrimSpace(j.URL),
+			PageNo:     j.PageNo,
+		}
+		var st RunStats
+		switch ext {
+		case ".ndjson", ".jsonl", ".json":
+			opt.FileExt = ext
+			st, err = w.Runner.RunNDJSON(ctx, bytes.NewReader(body), opt)
+		case ".txt", ".md", ".markdown":
+			plain.ChunkID = strings.TrimSpace(j.ChunkID)
+			if strings.TrimSpace(plain.DocID) == "" {
+				plain.DocID = util.StableDocIDFromS3Object(bucket, key)
+			}
+			if plain.Title == "" {
+				plain.Title = filepath.Base(key)
+			}
+			if plain.URL == "" {
+				plain.URL = fmt.Sprintf("s3://%s/%s", bucket, key)
+			}
+			st, err = w.Runner.RunPlain(ctx, string(body), plain)
+		default:
+			err = fmt.Errorf("unsupported extension %q (use .ndjson, .jsonl, .json, .txt, .md, .markdown)", ext)
+		}
 		if metaOn {
 			if err != nil {
 				if e := w.Meta.OnTaskFailed(ctx, j.JobID, tid, err); e != nil {
 					return e
 				}
-				return fmt.Errorf("run ndjson for %s: %w", key, err)
+				return fmt.Errorf("ingest s3 key %s: %w", key, err)
 			}
 			if e := w.Meta.OnTaskSucceeded(ctx, j.JobID, tid, int64(st.InputLines), int64(st.ChunksWritten)); e != nil {
 				return e
 			}
 		} else if err != nil {
-			return fmt.Errorf("run ndjson for %s: %w", key, err)
+			return fmt.Errorf("ingest s3 key %s: %w", key, err)
 		}
 	}
 	return w.Runner.Flush(ctx)

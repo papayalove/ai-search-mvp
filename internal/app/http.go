@@ -11,13 +11,16 @@ import (
 	querypipe "ai-search-v1/internal/query/pipeline"
 	"ai-search-v1/internal/queue"
 	"ai-search-v1/internal/storage/milvus"
+	storages3 "ai-search-v1/internal/storage/s3"
 )
 
 // NewHTTPServer builds the API HTTP handler stack (middleware + routes).
 // ingestBroker 非 nil 时注册 POST /v1/admin/ingest 与 POST /v1/admin/ingest/remote（异步入队）。
-func NewHTTPServer(searcher querypipe.Searcher, ingestBroker *queue.RedisBroker, ingestQE config.IngestQueueFromEnv, ingestChunkOpts chunk.RecursiveChunkOptions, milvusRepo *milvus.Repository, ingestMeta *ingestmeta.Service) http.Handler {
+// contentS3 非 nil 时 GET /v1/content 支持 s3:// 源（HTTP 源不依赖 S3）。
+func NewHTTPServer(searcher querypipe.Searcher, ingestBroker *queue.RedisBroker, ingestQE config.IngestQueueFromEnv, ingestChunkOpts chunk.RecursiveChunkOptions, milvusRepo *milvus.Repository, ingestMeta *ingestmeta.Service, contentS3 *storages3.Client) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/search", handler.NewSearchHandler(searcher))
+	mux.Handle("GET /v1/content", handler.NewContentHandler(contentS3))
 	mux.Handle("GET /v1/admin/collections", handler.NewAdminCollectionsHandler(milvusRepo))
 	mux.Handle("GET /v1/admin/partitions", handler.NewAdminPartitionsHandler(milvusRepo))
 	if ih := handler.NewIngestHandler(ingestBroker, ingestQE, ingestChunkOpts, ingestMeta); ih != nil {

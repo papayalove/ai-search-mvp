@@ -233,6 +233,9 @@ func toDTOHits(hits []pipeline.SearchHit) []dto.SearchHit {
 			URLOrDocID:  h.URLOrDocID,
 			PDFPage:     h.PDFPage,
 			Title:       h.Title,
+			Offset:      h.Offset,
+			PageNo:      h.PageNo,
+			Source:      h.Source,
 		}
 	}
 	return out

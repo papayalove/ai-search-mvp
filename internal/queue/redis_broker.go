@@ -2,11 +2,15 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// ErrDequeueIdle 表示 BRPop 在 timeout 内未等到任务（非错误，Worker 应继续循环以便响应 ctx 取消）。
+var ErrDequeueIdle = errors.New("queue: dequeue idle timeout")
 
 // RedisBroker 入库队列（Redis List）。
 type RedisBroker struct {
@@ -82,7 +86,8 @@ func (b *RedisBroker) Enqueue(ctx context.Context, j Job, metaTTL time.Duration)
 	return b.Client.LPush(ctx, b.ListKey, raw).Err()
 }
 
-// Dequeue 阻塞右侧弹出一条任务（timeout 0 则无限等待）。
+// Dequeue 阻塞右侧弹出一条任务。timeout<=0 时为无限等待（不推荐 Worker 使用：Windows 上 Ctrl+C 可能长时间无法打断）。
+// timeout>0 时若在时限内无任务则返回 ErrDequeueIdle。
 func (b *RedisBroker) Dequeue(ctx context.Context, timeout time.Duration) (Job, error) {
 	var sl []string
 	var err error
@@ -92,6 +97,9 @@ func (b *RedisBroker) Dequeue(ctx context.Context, timeout time.Duration) (Job, 
 		sl, err = b.Client.BRPop(ctx, timeout, b.ListKey).Result()
 	}
 	if err != nil {
+		if errors.Is(err, redis.Nil) || err == redis.Nil {
+			return Job{}, ErrDequeueIdle
+		}
 		return Job{}, err
 	}
 	if len(sl) != 2 {

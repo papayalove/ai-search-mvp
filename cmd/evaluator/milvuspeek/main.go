@@ -17,7 +17,7 @@ import (
 func main() {
 	config.LoadDotEnv()
 
-	cfgPath := flag.String("config", "", "api.yaml（默认 API_CONFIG 或 configs/api.yaml）")
+	cfgPath := flag.String("config", "", "api.yaml（默认 configs/api.yaml）")
 	limit := flag.Int64("limit", 20, "Query 最大条数")
 	expr := flag.String("expr", "", `查询表达式，默认 chunk_id != ""`)
 	ids := flag.String("ids", "", "若非空：按逗号分隔的 chunk_id 精确查询，忽略 -expr/-limit")
@@ -26,7 +26,7 @@ func main() {
 
 	def := config.DefaultAPIConfigPath
 	if *cfgPath == "" {
-		*cfgPath = config.ResolveAPIConfigPath(def)
+		*cfgPath = def
 	}
 
 	apiCfg, err := config.LoadAPI(*cfgPath)
@@ -62,7 +62,7 @@ func main() {
 				chunkIDs = append(chunkIDs, p)
 			}
 		}
-		out := []string{milvus.FieldChunkID, milvus.FieldDocID, milvus.FieldSourceType, milvus.FieldLang, milvus.FieldJobID, milvus.FieldTaskID, milvus.FieldCreatedTime, milvus.FieldUpdatedTime}
+		out := []string{milvus.FieldChunkID, milvus.FieldDocID, milvus.FieldTitle, milvus.FieldURL, milvus.FieldSourceType, milvus.FieldLang, milvus.FieldJobID, milvus.FieldTaskID, milvus.FieldCreatedTime, milvus.FieldUpdatedTime}
 		if !*noVec {
 			out = append(out, milvus.FieldEmbedding)
 		}
@@ -81,8 +81,8 @@ func main() {
 
 	for i := range rows {
 		r := rows[i]
-		fmt.Fprintf(os.Stdout, "--- [%d] chunk_id=%q doc_id=%q source_type=%q lang=%q job_id=%q task_id=%q created_ms=%d updated_ms=%d\n",
-			i+1, r.ChunkID, r.DocID, r.SourceType, r.Lang, r.JobID, r.TaskID, r.CreatedTime, r.UpdatedTime)
+		fmt.Fprintf(os.Stdout, "--- [%d] chunk_id=%q doc_id=%q title=%q url=%q source_type=%q lang=%q job_id=%q task_id=%q created_ms=%d updated_ms=%d\n",
+			i+1, r.ChunkID, r.DocID, r.Title, r.URL, r.SourceType, r.Lang, r.JobID, r.TaskID, r.CreatedTime, r.UpdatedTime)
 		if len(r.Embedding) == 0 {
 			fmt.Fprintln(os.Stdout, "    embedding: (empty or not requested)")
 			continue

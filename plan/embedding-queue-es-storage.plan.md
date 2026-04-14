@@ -40,7 +40,7 @@ isProject: true
 
 **动机**：Go 侧通过 HTTP 调嵌入已是事实（[internal/model/embedding/http_embedder.go](../internal/model/embedding/http_embedder.go)）；本地用 HuggingFace 跑 **Qwen3-Embedding-0.6B**（见 design §14）放在独立 Python 服务中最稳妥。
 
-**建议新增文档**（仅设计、本期可不写实现代码）：例如仓库下 `python/embedding-service/DESIGN.md`（或 `services/hf-embedding/DESIGN.md`），应包含：
+**建议新增文档**（仅设计、本期可不写实现代码）：例如仓库下 `model_services/embedding-service/DESIGN.md`（或 `services/hf-embedding/DESIGN.md`），应包含：
 
 - **目标与边界**：仅提供与现有 Go `http` embedder 兼容的 REST 契约；单机部署；不负责鉴权（或可选 API Key）。
 - **API 契约**：与现有配置对齐：`POST` 批量文本 → 返回 float 向量列表；维度与 `configs/api.yaml` 中 `embedding`/`milvus.vector_dim` 一致；超时与最大 batch 建议值。
@@ -224,4 +224,4 @@ sequenceDiagram
 
 **Python 嵌入服务**
 
-- **python/embedding-service**：`app.py`（FastAPI）、`embed_backend.py`（默认 `EMBEDDING_LOADER=huggingface` + mean pool，可选 sentence-transformers）；OpenAI 风格 `POST /v1/embeddings` + `GET /healthz`；与 Go `HTTPEmbedder` 的 `openai_data` 响应格式一致。联调：`EMBEDDING_SOURCE=self_hosted`，`EMBEDDING_LOCAL_HTTP_HOST`/`PORT` 指向服务，鉴权用 **EMBEDDING_LOCAL_API_KEY**（与 Python 侧 `EMBEDDING_SERVICE_API_KEY` 对齐）；**勿**用 `EMBEDDING_API_KEY` 连自建服务。模型与 `expected_dim` 须与 `configs/api.yaml` 一致。详见主文档 [design.md](../design.md) §6.3。
+- **model_services/embedding-service**：`app.py`（FastAPI）、`embed_backend.py`（默认 `EMBEDDING_LOADER=huggingface` + mean pool，可选 sentence-transformers）；OpenAI 风格 `POST /v1/embeddings` + `GET /healthz`；与 Go `HTTPEmbedder` 的 `openai_data` 响应格式一致。联调：`EMBEDDING_SOURCE=self_hosted`，`EMBEDDING_LOCAL_HTTP_HOST`/`PORT` 指向服务，鉴权用 **EMBEDDING_LOCAL_API_KEY**（与 Python 侧 `EMBEDDING_SERVICE_API_KEY` 对齐）；**勿**用 `EMBEDDING_API_KEY` 连自建服务。模型与 `expected_dim` 须与 `configs/api.yaml` 一致。详见主文档 [design.md](../design.md) §6.3。

@@ -73,16 +73,21 @@ func (h *IngestRemoteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		deferTaskES = strings.TrimSpace(req.Bucket) != "" && strings.TrimSpace(req.Prefix) != "" &&
 			len(req.Keys) == 0 && len(req.S3URIs) == 0
 	}
+	upsert := true
+	if req.Upsert != nil {
+		upsert = *req.Upsert
+	}
 	j := queue.Job{
 		JobID:           jobID,
 		JobName:         jobName,
 		PayloadKind:     queue.PayloadKindS3,
 		Partition:       strings.TrimSpace(req.Partition),
-		Upsert:          req.Upsert,
-		ChunkExpand:     req.ChunkExpand,
+		Upsert:          upsert,
 		SourceType:      strings.TrimSpace(req.SourceType),
 		Lang:            strings.TrimSpace(req.Lang),
 		DocID:           strings.TrimSpace(req.DocID),
+		Title:           strings.TrimSpace(req.Title),
+		URL:             strings.TrimSpace(req.URL),
 		PageNo:          req.PageNo,
 		TaskID:          strings.TrimSpace(req.TaskID),
 		S3URIs:          req.S3URIs,

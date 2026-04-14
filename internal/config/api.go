@@ -13,7 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultAPIConfigPath is used when API_CONFIG is unset.
+// DefaultAPIConfigPath is the default api.yaml path when callers do not pass -config.
 const DefaultAPIConfigPath = "configs/api.yaml"
 
 // API holds settings loaded from configs/api.yaml.
@@ -71,6 +71,8 @@ type MilvusConfig struct {
 	MaxJobIDLen   int `yaml:"max_job_id_len"`
 	MaxTaskIDLen  int `yaml:"max_task_id_len"`
 	MaxExtraInfoLen int `yaml:"max_extra_info_len"`
+	MaxTitleLen     int `yaml:"max_title_len"`
+	MaxURLLen       int `yaml:"max_url_len"`
 
 	// 向量索引：autoindex（默认）或 hnsw；修改已存在 collection 需删原向量索引或重建 collection。
 	IndexType           string `yaml:"index_type"`
@@ -224,6 +226,8 @@ func (m MilvusConfig) ToMilvus() milvus.Config {
 		MaxJobIDLen:         m.MaxJobIDLen,
 		MaxTaskIDLen:        m.MaxTaskIDLen,
 		MaxExtraInfoLen:     m.MaxExtraInfoLen,
+		MaxTitleLen:         m.MaxTitleLen,
+		MaxURLLen:           m.MaxURLLen,
 		IndexType:           indexType,
 		HNSW_M:              hnswM,
 		HNSW_EfConstruction: hnswEfConstruction,
@@ -245,12 +249,4 @@ func LoadAPI(path string) (*API, error) {
 		c.HTTP.Addr = ":8080"
 	}
 	return &c, nil
-}
-
-// ResolveAPIConfigPath returns API_CONFIG if set, otherwise defaultPath (e.g. DefaultAPIConfigPath).
-func ResolveAPIConfigPath(defaultPath string) string {
-	if p := strings.TrimSpace(os.Getenv("API_CONFIG")); p != "" {
-		return p
-	}
-	return defaultPath
 }

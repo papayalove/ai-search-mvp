@@ -16,7 +16,11 @@ type TextChunkLine struct {
 	ChunkID    string `json:"chunk_id"`
 	Text       string `json:"text"`
 	DocID      string `json:"doc_id"`
+	Title      string `json:"title,omitempty"`
+	URL        string `json:"url,omitempty"`
 	PageNo     int    `json:"page_no"`
+	// Offset 为当前 page 内 chunk 文本起始的字节偏移（UTF-8 字节）；切分后由 SplitRecord 写入。
+	Offset int64 `json:"offset"`
 	ChunkNo    int    `json:"chunk_no"`
 	EntityKeys []string `json:"entity_keys"`
 	SourceType string `json:"source_type"`
@@ -45,6 +49,8 @@ func ParseTextChunkLine(line []byte) (TextChunkLine, error) {
 	r.ChunkID = strings.TrimSpace(r.ChunkID)
 	r.Text = strings.TrimSpace(r.Text)
 	r.DocID = strings.TrimSpace(r.DocID)
+	r.Title = strings.TrimSpace(r.Title)
+	r.URL = strings.TrimSpace(r.URL)
 	r.SourceType = strings.TrimSpace(r.SourceType)
 	r.Lang = strings.TrimSpace(r.Lang)
 	r.JobID = strings.TrimSpace(r.JobID)
@@ -71,9 +77,7 @@ func ParseTextChunkLine(line []byte) (TextChunkLine, error) {
 	if r.Text == "" {
 		return TextChunkLine{}, fmt.Errorf("chunk_id %q: text is required", r.ChunkID)
 	}
-	if r.SourceType == "" {
-		r.SourceType = "default"
-	}
+	// source_type 空表示行内未写；RunNDJSON 再按文件后缀与 Job 级 source_type 补齐。
 	if r.Lang == "" {
 		r.Lang = "und"
 	}
@@ -85,6 +89,12 @@ func ParseTextChunkLine(line []byte) (TextChunkLine, error) {
 	if len(bytes.TrimSpace(r.ExtraInfo)) == 0 {
 		r.ExtraInfo = nil
 	}
+	if r.PageNo < 0 {
+		r.PageNo = 0
+	}
+	if r.Offset < 0 {
+		r.Offset = 0
+	}
 	return r, nil
 }
 
@@ -95,7 +105,29 @@ func SplitRecord(rec TextChunkLine, opts RecursiveChunkOptions) ([]TextChunkLine
 		return nil, err
 	}
 	out := make([]TextChunkLine, 0, len(parts))
+	full := []byte(rec.Text)
+	// 下一块可能在「上一块起始之后」的任意位置开始（chunk_overlap>0 时与上一块尾部重叠），
+	// 不能假设各块在原文中首尾相接。
+	prevStart := -1
 	for i, txt := range parts {
+		t := []byte(txt)
+		if len(t) == 0 {
+			return nil, fmt.Errorf("chunk split: empty text part %d", i)
+		}
+		minB := 0
+		if i > 0 {
+			minB = prevStart + 1
+		}
+		if minB > len(full)-len(t) {
+			return nil, fmt.Errorf("chunk split: part %d not aligned with parent text", i)
+		}
+		idx := bytes.Index(full[minB:], t)
+		if idx < 0 {
+			return nil, fmt.Errorf("chunk split: part %d not aligned with parent text", i)
+		}
+		absByte := minB + idx
+		prevStart = absByte
+		byteOff := rec.Offset + int64(absByte)
 		var id string
 		switch {
 		case len(parts) == 1:
@@ -109,7 +141,10 @@ func SplitRecord(rec TextChunkLine, opts RecursiveChunkOptions) ([]TextChunkLine
 			ChunkID:    id,
 			Text:       txt,
 			DocID:      rec.DocID,
+			Title:      rec.Title,
+			URL:        rec.URL,
 			PageNo:     rec.PageNo,
+			Offset:     byteOff,
 			ChunkNo:    rec.ChunkNo + i,
 			EntityKeys: rec.EntityKeys,
 			SourceType: rec.SourceType,

@@ -9,10 +9,9 @@ import (
 // PipelineSnapshotJSON 入队参数快照，写入 ingest_job.pipeline_params。
 func PipelineSnapshotJSON(j queue.Job) ([]byte, error) {
 	m := map[string]any{
-		"partition":     j.Partition,
-		"upsert":        j.Upsert,
-		"chunk_expand":  j.ChunkExpand,
-		"source_type":   j.SourceType,
+		"partition":   j.Partition,
+		"upsert":      j.Upsert,
+		"source_type": j.SourceType,
 		"lang":          j.Lang,
 		"doc_id":        j.DocID,
 		"page_no":       j.PageNo,

@@ -4,6 +4,7 @@
 
 - 架构图版（评审）：[design-architecture.md](./design-architecture.md)
 - 开发执行版（任务清单）：[design-tasks.md](./design-tasks.md)
+- 实现与计划同步记录：**§15**（按日期汇总，便于与 [plan/](./plan/) 对照）
 
 本文件保留完整系统设计信息，作为主文档。
 
@@ -42,7 +43,7 @@ MVP 范围：
 - Reranker（外部 API）：对候选集合统一精排。
 - **Redis 入库队列**：multipart 与远程 S3 引用先入队，由 Worker 消费（见 §4.2.1）。
 - **S3（只读）**：远程入库任务中按对象键流式拉取 NDJSON 正文（凭证与 endpoint 见 `.env`）。
-- **嵌入**：Go 进程内**仅**通过 **OpenAI 兼容 HTTP** 调嵌入；可选**远端 API**或**自建 Python 服务**（`python/embedding-service`），由 **`EMBEDDING_SOURCE`** 切换（见 §6.3）。
+- **嵌入**：Go 进程内**仅**通过 **OpenAI 兼容 HTTP** 调嵌入；可选**远端 API**或**自建 Python 服务**（`model_services/embedding-service`），由 **`EMBEDDING_SOURCE`** 切换（见 §6.3）。
 - Ingestion Pipeline（Go）：`cmd/importer` Worker 或 `-input` 单次文件，经 Runner 写 Milvus + ES。
 
 ## 4. 数据模型与索引设计
@@ -73,9 +74,12 @@ MVP 范围：
 ### 4.2.1 入库队列（Redis + Worker）
 
 - `POST /v1/admin/ingest`（multipart）与 `POST /v1/admin/ingest/remote`（JSON + S3 引用）均**先入 Redis 队列**，返回 **202** 与 `job_id`。
+- **队列元素与 Job**：Redis **List** 上 **`LPush` 的一条字符串** = 序列化后的 **一个 `queue.Job`**。一次 multipart 请求里多个文件仍属 **同一** `job_id`（同一 Job 的 `files[]`）；一次 remote 请求也是一个 Job（可含多条 `s3_uris` 等）。另有 `ingest:p:{job_id}:…` 等 **payload / 元数据** key，与「待消费 list」不同。
+- **出队语义**：Worker 使用 **`BRPOP`**，**每条 list 元素只会被一个 consumer 弹出一次**（多 worker 并行时各自取 **不同** 的下一条；若进程在 `ProcessJob` 中途崩溃，已出队的任务不会自动回到队列，需运维或业务侧重试策略）。
 - multipart 文件正文写入 Redis，**TTL 默认 3h**（测试向）；远程 job 相关元数据/状态键 **TTL 默认 24h**。
-- **Worker**：`cmd/importer` 在无 `-input` 等「单次文件」参数时消费队列，调用现有 **Runner** 同时写 **Milvus 与 ES**（ES 未启用则跳过）；远程路径对 S3 对象 **流式 GetObject** 后按 NDJSON 行处理。
-- 配置以环境变量为主，见仓库根目录 `.env.example`（`INGEST_*`、`S3_ENDPOINT`、`AWS_*`）。
+- **Worker**：`cmd/importer` 在无 `-input` 等「单次文件」参数时消费队列，调用现有 **Runner** 同时写 **Milvus 与 ES**（ES 未启用则跳过）。**S3 对象**：按 **对象 key 扩展名** 分支——**`.ndjson` / `.jsonl` / `.json`** 走按行 NDJSON；**`.txt` / `.md` / `.markdown`** 走整篇 `RunPlain`（与 multipart 一致，均再经 `ingest.chunk_*` 切分）。单对象正文读入上限与 multipart 单文件一致（**32MiB**）。若 Job 未带 `doc_id` 且为上述纯文本路径，**`doc_id`** 取 **`s3://bucket/key` 的 SHA-256 十六进制**（`pkg/util.StableDocIDFromS3Object`），以便 `RunPlain` 派生稳定 `chunk_id`。
+- **多 Worker**：默认**不**持 Redis 单例锁，**多进程可并行消费**同一 list；本进程内 **`-workers` / `REDIS_INGEST_WORKER_CONCURRENCY`＞1** 时多个 **`ProcessJob` 可并行**。若须同队列仅单进程： **`IMPORTER_REQUIRE_SINGLETON_LOCK=true`** 或 **`-require-singleton-lock`**。
+- 配置以环境变量为主，见仓库根目录 `.env.example`（`INGEST_*`、`S3_ENDPOINT`、`AWS_*`、`S3_ADDRESSING_STYLE`、`IMPORTER_REQUIRE_SINGLETON_LOCK` 等）。
 
 ### 4.3 Milvus（向量索引）
 Collection 建议：`chunk_vectors_v1`（列变更需新建 collection 或删建）
@@ -162,6 +166,8 @@ Collection 建议：`chunk_vectors_v1`（列变更需新建 collection 或删建
 | `POST /v1/admin/ingest` | multipart 文件正文写入 Redis（TTL 默认 3h），任务入队，返回 **202** + `job_id` | `REDIS_INGEST_ENABLED=true` 且已配置 `REDIS_INGEST_URL` 或 `REDIS_INGEST_HOST`（可配 `REDIS_INGEST_PASSWORD` 等）并成功连接 Redis；否则不注册该路由 |
 | `POST /v1/admin/ingest/remote` | JSON 携带 S3 引用等并入队，**202** + `job_id` | 同上 |
 
+multipart 接受扩展名：**`.ndjson`、`.jsonl`、`.json`**（按行 NDJSON）、**`.txt`、`.md`**（整篇再走 §7.1 切分）。**无** `chunk` / `chunk_expand` 表单字段。
+
 Worker：`cmd/importer` **无** `-input` 时常驻消费队列，调用 **Runner** 同时写 **Milvus + ES**（与 `configs/api.yaml` 开关一致）；**带** `-input` 时仍为单次 NDJSON 文件导入（不经过队列）。细节见 §4.2.1。
 
 ### 6.3 嵌入 HTTP 客户端（Go）与 `EMBEDDING_SOURCE`
@@ -172,12 +178,12 @@ Worker：`cmd/importer` **无** `-input` 时常驻消费队列，调用 **Runner
 
 | 取值 | 嵌入 URL 推导 | API Key（`Authorization: Bearer`） |
 |------|----------------|-----------------------------------|
-| `remote`（及 `api`、`cloud`） | `EMBEDDING_ENDPOINT`（完整 URL）优先；否则 `EMBEDDING_API_BASE_URL` + `/v1/embeddings`；再否则 yaml `embedding.endpoint` | **`EMBEDDING_API_KEY`**（覆盖 yaml `api_key`） |
+| `remote`（及 `api`、`cloud`） | 若设置 `EMBEDDING_API_BASE_URL`（API 根，不含 path）则请求 `{BASE}/v1/embeddings`；否则使用 yaml `embedding.endpoint` | **`EMBEDDING_API_KEY`**（覆盖 yaml `api_key`） |
 | `self_hosted`（及 `local_service`、`python`） | `http://EMBEDDING_LOCAL_HTTP_HOST:EMBEDDING_LOCAL_HTTP_PORT/v1/embeddings`（`0.0.0.0` 在客户端侧会规范为 `127.0.0.1`） | **仅** **`EMBEDDING_LOCAL_API_KEY`**（为空则不带 Bearer；**不使用** `EMBEDDING_API_KEY`，避免与远程混用） |
 
 请求体中的 `model` 等仍由 yaml / `EMBEDDING_API_MODEL` 等配置，须与对端服务约定一致。
 
-**自建 Python 嵌入服务**（可选）：[python/embedding-service](python/embedding-service) 提供与上述相同的 OpenAI 风格 `POST /v1/embeddings`；进程内鉴权见该目录 `DESIGN.md`（`EMBEDDING_SERVICE_API_KEY` / `EMBEDDING_LOCAL_API_KEY`，**勿**与 Go 的 `EMBEDDING_API_KEY` 混读）。默认模型加载策略为 **`EMBEDDING_LOADER=huggingface`**（transformers `AutoModel` + mean pool），可选 `sentence_transformers`。
+**自建 Python 嵌入服务**（可选）：[model_services/embedding-service](model_services/embedding-service) 提供与上述相同的 OpenAI 风格 `POST /v1/embeddings`；进程内鉴权见该目录 `DESIGN.md`（`EMBEDDING_SERVICE_API_KEY` / `EMBEDDING_LOCAL_API_KEY`，**勿**与 Go 的 `EMBEDDING_API_KEY` 混读）。默认模型加载策略为 **`EMBEDDING_LOADER=huggingface`**（transformers `AutoModel` + mean pool），可选 `sentence_transformers`。
 
 **冒烟脚本**：仓库根目录 `demo_call_local.py` 按 **`EMBEDDING_SOURCE`** 调用远程或本地嵌入 URL，并选用对应 Key（未设置 `EMBEDDING_SOURCE` 时脚本默认按 `self_hosted` 测本机）。
 
@@ -188,13 +194,15 @@ Worker：`cmd/importer` **无** `-input` 时常驻消费队列，调用 **Runner
 与 §4.2.1、§6.2 一致，流程为：
 
 1. 客户端调用 Admin 入库接口 → 任务入队（multipart 正文或 S3 元数据在 Redis 中 TTL 管理）。
-2. `cmd/importer` Worker 出队 → 解析 NDJSON（远程经 S3 **GetObject** 流式读）→ chunk / 实体等管线。
+2. `cmd/importer` Worker **`BRPOP` 出队** → 按载荷类型与 **S3 扩展名 / multipart 扩展名** 选择 NDJSON 行或整篇文本路径（见 §4.2.1）→ chunk / 实体等管线。
 3. **嵌入**：通过 **HTTP** 调用配置的嵌入服务（`EMBEDDING_SOURCE` 决定远端或自建），**非**本进程直接加载 PyTorch/ONNX。
 4. Runner **同时写入** Milvus 与 ES（按 yaml 启用项）。
 
+**文本切分策略（与实现一致）**：NDJSON 类扩展名 **`.ndjson` / `.jsonl` / `.json`**（按行 JSON，语义同 NDJSON 流）以及 **`.txt` / `.md`** 整篇导入时，**一律**按 `configs/api.yaml` 中 **`ingest.chunk_size`、`ingest.chunk_overlap`** 等（`RecursiveChunkOptions`）对正文递归切分后再嵌入；**不提供**关闭二次切分的 API/表单/队列字段。旧队列消息中若仍含已废弃字段，Worker 侧忽略即可。
+
 ### 7.2 单次文件导入（不经过队列）
 
-`cmd/importer -input <path> ...`：同步读取本地 NDJSON，同样走 Runner 与同一套嵌入 HTTP 配置，适用于离线批跑与小规模试导。
+`cmd/importer -input <path> ...`：同步读取本地 **NDJSON 行文件**（扩展名与队列侧一致时含 `.json`），同样走 Runner 与同一套嵌入 HTTP 配置，适用于离线批跑与小规模试导；切分策略与 §7.1 相同（**始终**按 `ingest.chunk_*` 切分）。
 
 ### 7.3 离线日更（概念流程）
 
@@ -295,7 +303,7 @@ Worker：`cmd/importer` **无** `-input` 时常驻消费队列，调用 **Runner
     config/
     observability/
   pkg/{types,util}
-  python/embedding-service/   # 可选：自建 OpenAI 兼容嵌入 HTTP
+  model_services/embedding-service/   # 可选：自建 OpenAI 兼容嵌入 HTTP
   configs/
   demo_call_local.py          # 按 EMBEDDING_SOURCE 测嵌入 HTTP
   deployments/{docker,k8s}
@@ -350,7 +358,43 @@ M3（规模化准备）：
 
 实现上 **向量维** 须与 `configs/api.yaml` 中 `milvus.vector_dim`、`embedding.expected_dim` 一致。
 
-- **远端 OpenAI 兼容 API**：`EMBEDDING_SOURCE=remote`，配置 `EMBEDDING_API_BASE_URL` / `EMBEDDING_ENDPOINT` 与 `EMBEDDING_API_KEY`（§6.3）。
-- **自建 Python 服务**：`EMBEDDING_SOURCE=self_hosted`，与 `python/embedding-service` 联调；支持 Hub ID 或本地 checkpoint 路径、`EMBEDDING_MODEL_KWARGS`（JSON）等，详见该目录 `DESIGN.md` 与 `README.md`。
+- **远端 OpenAI 兼容 API**：`EMBEDDING_SOURCE=remote`，配置 `EMBEDDING_API_BASE_URL`（或 yaml `embedding.endpoint`）与 `EMBEDDING_API_KEY`（§6.3）。
+- **自建 Python 服务**：`EMBEDDING_SOURCE=self_hosted`，与 `model_services/embedding-service` 联调；支持 Hub ID 或本地 checkpoint 路径、`EMBEDDING_MODEL_KWARGS`（JSON）等，详见该目录 `DESIGN.md` 与 `README.md`。
 
 Reranker 仍为外部 HTTP，与本节嵌入部署独立。
+
+## 15. 变更与实现同步（2026-04-10）
+
+本节汇总**当日**与近期设计文档（`plan/`）对齐的落地修改，便于评审 `design.md` 与代码的一致性。详细字段级说明仍以源码与 `plan/*.plan.md` 为准。
+
+### 15.1 关联计划文档
+
+| 文档 | 主题 |
+|------|------|
+| [plan/ingest-metadata-mysql-es.plan.md](./plan/ingest-metadata-mysql-es.plan.md) | 入库 Job/Task 元数据、MySQL `ingest_job`、ES 任务索引与 Worker 回写 |
+| [plan/embedding-queue-es-storage.plan.md](./plan/embedding-queue-es-storage.plan.md) | Redis 队列载荷、Milvus/ES 双写、multipart 与 S3 入队形态 |
+
+### 15.2 入库与队列（Go）
+
+- **`chunk_expand` 已移除**：multipart、`POST /v1/admin/ingest/remote` DTO、`internal/queue.Job` JSON、`ingest_job.pipeline_params` 快照均**不再**包含该开关；`internal/ingest/pipeline` 中 NDJSON 与纯文本路径**始终**调用 `SplitRecord`（与 §7.1 描述一致）。
+- **扩展名**：Admin multipart 与 Worker 对 **`.json`** 与 **`.ndjson` / `.jsonl`** 同等处理（按行 NDJSON 语义）；**非**标准单行 JSON 的大文件仍可能解析失败。
+- **`cmd/importer`（Worker 模式）**：支持 **`IMPORTER_HTTP_ADDR`** 健康检查（默认 `:18080`，空则关闭）；默认**不**持 Redis 单例锁，**多进程可并行消费**同一队列；若需同队列仅单进程：`IMPORTER_REQUIRE_SINGLETON_LOCK` / `-require-singleton-lock`；**`-workers`** 与 **`REDIS_INGEST_WORKER_CONCURRENCY`** 控制本进程内消费协程数（可并行执行多个 `ProcessJob`）；Windows 下 **`os.Interrupt`** 与 BRPOP 超时配合退出；stderr 启动日志与空闲心跳。
+- **MySQL 元数据**：Worker 在配置 **`MYSQL_DSN`** 且 Repo 可用时注入 **`ingestmeta.Service`**，更新 **`ingest_job`** 生命周期（不仅依赖 `INGEST_META_ENABLED`）；`total_docs` / `total_chunks` 等语义与 migration 注释及 Runner 统计对齐。
+- **配置注释**：[configs/api.yaml](./configs/api.yaml)、[configs/importer.yaml](./configs/importer.yaml) 已改为「始终按 `ingest.chunk_*` 切分」表述。
+
+### 15.3 Web：`heroic-web3-gateway`
+
+- **Admin**：multipart **`job_name`** 由前端传入；批量上传可 **NDJSON 与纯文本同一请求**（已不再依赖按批拆分 `chunk` 表单）。
+- **Search（`/search`）**：左侧展开菜单为无边框 **图标 + 文案** 行：**新对话**、**Knowledge**（`/admin`）、**API**（`VITE_API_BASE_URL` 去尾斜杠后的 `/v1`，未配置则用相对 `/v1` 新标签打开）；**history** 为小节标题，其下列表仅在已有用户检索记录时渲染；**无**「历史搜索」入口与空列表时的占位图标/提示文案。
+
+### 15.4 后续文档维护约定
+
+- 行为型变更（API 字段、队列 JSON、默认策略）应同时更新 **§6–§7** 与本节 **§15** 日期条目。
+- 任务级勾选仍以 [design-tasks.md](./design-tasks.md) 为准；架构图以 [design-architecture.md](./design-architecture.md) 为准。
+
+### 15.5 变更与实现同步（2026-04-13）
+
+- **§4.2.1 队列与 Worker**：补充 **「一条 list 元素 = 一个 `queue.Job`」**、**`BRPOP` 单消费者语义**、**S3 按扩展名 NDJSON / 整篇**、**无 `doc_id` 时 S3 路径哈希**、**默认多 worker 并行**与 **`IMPORTER_REQUIRE_SINGLETON_LOCK`** 可选单进程锁。
+- **Admin multipart / remote 默认 `upsert`**：未传或省略时 Milvus 侧默认 **Upsert**；显式 `false` 为 Insert（见 handler 与 `cmd/importer` `-upsert` 默认值）。
+- **S3 客户端**：未配置 **`AWS_REGION`** 时由 **`EffectiveRegion`** 使用占位 **`us-east-1`** 满足 SDK；**`S3_ADDRESSING_STYLE=path`** / `virtual` 与自定义 **`S3_ENDPOINT`** 行为见 `internal/storage/s3/config.go`。
+- **目录**：自建嵌入 HTTP 由 **`model_services/embedding-service`** 承载（原 `python/embedding-service`）；文档、`demo_call_local.py` 与配置注释中的路径已同步。

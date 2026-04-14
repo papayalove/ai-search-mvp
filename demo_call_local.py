@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 按根目录 .env 的 EMBEDDING_SOURCE 对嵌入 HTTP 做冒烟测试（与 Go internal/config/embedding.go 一致）：
-  - remote（及 api、cloud）→ EMBEDDING_ENDPOINT 或 EMBEDDING_API_BASE_URL + /v1/embeddings，Bearer 用 EMBEDDING_API_KEY
+  - remote（及 api、cloud）→ EMBEDDING_API_BASE_URL + /v1/embeddings，Bearer 用 EMBEDDING_API_KEY
   - self_hosted（及 local_service、python；或未设置 SOURCE 时默认 self_hosted）→ 本地 host:port，Bearer 用 EMBEDDING_LOCAL_API_KEY 或 EMBEDDING_SERVICE_API_KEY
 
 用法（须在仓库根目录）：
@@ -32,7 +32,7 @@ def _load_dotenv() -> None:
         return
     root = os.path.dirname(os.path.abspath(__file__))
     load_dotenv(os.path.join(root, ".env"))
-    emb = os.path.join(root, "python", "embedding-service", ".env")
+    emb = os.path.join(root, "model_services", "embedding-service", ".env")
     if os.path.isfile(emb):
         load_dotenv(emb, override=True)
 
@@ -51,18 +51,14 @@ def main() -> int:
     health_base: str | None = None
 
     if src in ("remote", "api", "cloud"):
-        ep = os.getenv("EMBEDDING_ENDPOINT", "").strip()
-        if ep:
-            url = ep
-        else:
-            base = os.getenv("EMBEDDING_API_BASE_URL", "").strip().rstrip("/")
-            if not base:
-                print(
-                    "EMBEDDING_SOURCE=remote 时需要设置 EMBEDDING_ENDPOINT 或 EMBEDDING_API_BASE_URL",
-                    file=sys.stderr,
-                )
-                return 1
-            url = base + "/v1/embeddings"
+        base = os.getenv("EMBEDDING_API_BASE_URL", "").strip().rstrip("/")
+        if not base:
+            print(
+                "EMBEDDING_SOURCE=remote 时需要设置 EMBEDDING_API_BASE_URL（API 根地址，不含 /v1/embeddings）",
+                file=sys.stderr,
+            )
+            return 1
+        url = base + "/v1/embeddings"
         api_key = os.getenv("EMBEDDING_API_KEY", "").strip()
         model = os.getenv("EMBEDDING_API_MODEL", "").strip() or "BAAI/bge-m3"
     elif src in ("self_hosted", "local_service", "python"):

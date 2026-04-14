@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"ai-search-v1/internal/model/embedding"
+	"ai-search-v1/internal/query"
 	"ai-search-v1/internal/query/recall"
 	queryrewrite "ai-search-v1/internal/query/rewrite"
 	"ai-search-v1/internal/storage/es"
@@ -168,7 +169,7 @@ func (s *MilvusSearcher) queryByChunkIDLike(ctx context.Context, sub string, lim
 }
 
 func (s *MilvusSearcher) queryByChunkIDField(ctx context.Context, id string, limit int64) ([]SearchHit, error) {
-	out := []string{milvus.FieldChunkID, milvus.FieldDocID, milvus.FieldSourceType, milvus.FieldLang, milvus.FieldUpdatedTime}
+	out := []string{milvus.FieldChunkID, milvus.FieldDocID, milvus.FieldTitle, milvus.FieldURL, milvus.FieldSourceType, milvus.FieldLang, milvus.FieldUpdatedTime, milvus.FieldOffset, milvus.FieldPageNo}
 	exact, err := s.Repo.QueryByChunkIDs(ctx, []string{id}, out)
 	if err != nil {
 		return nil, err
@@ -205,6 +206,14 @@ func (s *MilvusSearcher) queryByText(ctx context.Context, text string, topK int)
 	hits := make([]SearchHit, 0, len(row))
 	for i := range row {
 		m := row[i]
+		title := m.Title
+		if title == "" {
+			title = m.ChunkID
+		}
+		url := m.URL
+		if url == "" {
+			url = m.DocID
+		}
 		hits = append(hits, SearchHit{
 			ChunkID:    m.ChunkID,
 			DocID:      m.DocID,
@@ -213,8 +222,11 @@ func (s *MilvusSearcher) queryByText(ctx context.Context, text string, topK int)
 			Ts:         m.UpdatedTime,
 			CreatedTs:  m.CreatedTime,
 			Score:      float64(m.Score),
-			URLOrDocID: m.DocID,
-			Title:      m.ChunkID,
+			URLOrDocID: url,
+			Title:      title,
+			Offset:     m.Offset,
+			PageNo:     int(m.PageNo),
+			Source:     query.ContentFetchSource(m.URL, url),
 		})
 	}
 	return hits, nil
@@ -227,6 +239,14 @@ func recordsToSearchHits(recs []milvus.ChunkRecord, score float64) []SearchHit {
 	out := make([]SearchHit, len(recs))
 	for i := range recs {
 		r := recs[i]
+		title := r.Title
+		if title == "" {
+			title = r.ChunkID
+		}
+		url := r.URL
+		if url == "" {
+			url = r.DocID
+		}
 		out[i] = SearchHit{
 			ChunkID:    r.ChunkID,
 			DocID:      r.DocID,
@@ -235,8 +255,11 @@ func recordsToSearchHits(recs []milvus.ChunkRecord, score float64) []SearchHit {
 			Ts:         r.UpdatedTime,
 			CreatedTs:  r.CreatedTime,
 			Score:      score,
-			URLOrDocID: r.DocID,
-			Title:      r.ChunkID,
+			URLOrDocID: url,
+			Title:      title,
+			Offset:     r.Offset,
+			PageNo:     int(r.PageNo),
+			Source:     query.ContentFetchSource(r.URL, url),
 		}
 	}
 	return out
@@ -261,6 +284,9 @@ func recallHitsToSearchHits(in []recall.Hit) []SearchHit {
 			URLOrDocID:   h.URLOrDocID,
 			PDFPage:      h.PDFPage,
 			Title:        h.Title,
+			Offset:       h.Offset,
+			PageNo:       h.PageNo,
+			Source:       h.Source,
 			RecallSource: h.RecallSource,
 		}
 	}

@@ -29,6 +29,10 @@ type SearchHit struct {
 	URLOrDocID  string  `json:"url_or_doc_id"`
 	PDFPage     *int    `json:"pdf_page,omitempty"`
 	Title       string  `json:"title"`
+	Offset      int64   `json:"offset"`
+	PageNo      int     `json:"page_no"`
+	// Source 为可用于 GET /v1/content 的 http(s) 或 s3://（与入库 url 对齐）；无可用源时省略。
+	Source string `json:"source,omitempty"`
 }
 
 // SearchDebug is optional diagnostic payload.

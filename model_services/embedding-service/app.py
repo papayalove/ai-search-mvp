@@ -21,6 +21,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from embed_backend import EmbedBackend, build_backend
+import keyphrase_backend
 
 
 def _load_dotenv_files() -> None:
@@ -257,6 +258,38 @@ class EmbeddingsRequest(BaseModel):
     encoding_format: str | None = None
 
 
+class KeywordsRequest(BaseModel):
+    """与 KeyBERT.extract_keywords 主要参数对齐；中文长句建议 analyzer=char_wb。"""
+
+    text: str = Field(..., min_length=1, description="待提取关键词的原文")
+    model: str | None = Field(
+        default=None,
+        description="Sentence-Transformers 模型 id；默认读环境变量 KEYBERT_MODEL（all-MiniLM-L6-v2）",
+    )
+    keyphrase_ngram_range: tuple[int, int] = Field(
+        default=(1, 2),
+        description="候选短语 n-gram 范围，与 KeyBERT 一致",
+    )
+    top_n: int = Field(default=5, ge=1, le=100)
+    analyzer: str | None = Field(
+        default=None,
+        description="null：默认按词分词（偏英文）；char_wb：字边界 n-gram，适合中文",
+    )
+    stop_words: Union[str, List[str], None] = Field(
+        default=None,
+        description="如 english 或自定义停用词列表，传给 CountVectorizer",
+    )
+    use_mmr: bool = Field(default=False, description="是否 MMR 去冗（与 diversity 联用）")
+    diversity: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(key, str(default)).strip()))
+    except ValueError:
+        return default
+
+
 def _require_bearer(authorization: str | None, expected: str) -> None:
     if not expected:
         return
@@ -326,6 +359,79 @@ def create_embeddings(
     return {"object": "list", "data": data, "model": _model_id_loaded}
 
 
+@app.post("/v1/keywords")
+def extract_keywords(
+    body: KeywordsRequest,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """
+    KeyBERT 风格关键词/关键短语提取（sentence-transformers 句向量 + 与文档的余弦相似度）。
+    与嵌入模型独立：默认 KEYBERT_MODEL=all-MiniLM-L6-v2，首次调用时下载/加载。
+    """
+    cfg = getattr(app.state, "runtime", None) or _runtime
+    _require_bearer(authorization, cfg.get("api_key", ""))
+
+    max_chars = _env_int("KEYWORD_MAX_TEXT_CHARS", 65536)
+    if max_chars > 0 and len(body.text) > max_chars:
+        raise HTTPException(
+            status_code=400,
+            detail=f"text length {len(body.text)} exceeds KEYWORD_MAX_TEXT_CHARS={max_chars}",
+        )
+
+    lo, hi = body.keyphrase_ngram_range
+    if lo < 1 or hi < 1 or lo > hi or hi > 5:
+        raise HTTPException(
+            status_code=400,
+            detail="keyphrase_ngram_range 须满足 1<=low<=high<=5",
+        )
+
+    model_id = (body.model or "").strip() or keyphrase_backend.default_keybert_model_id()
+    strict_kw = _env_bool("KEYWORD_STRICT_MODEL", False)
+    if strict_kw and body.model and not _models_match(
+        body.model.strip(), keyphrase_backend.default_keybert_model_id()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="KEYWORD_STRICT_MODEL=true 时，请求体 model 须与环境变量 KEYBERT_MODEL 一致",
+        )
+
+    vec = None
+    an = (body.analyzer or "").strip().lower()
+    if an in ("char_wb", "char-wb", "cjk"):
+        vec = keyphrase_backend.build_char_wb_vectorizer((lo, hi))
+    elif an in ("", "none", "word"):
+        pass
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="analyzer 仅支持 null/word、char_wb（或 cjk）",
+        )
+
+    try:
+        pairs = keyphrase_backend.extract_keyphrases(
+            body.text,
+            model_id=model_id,
+            keyphrase_ngram_range=(lo, hi),
+            top_n=body.top_n,
+            stop_words=body.stop_words,
+            use_mmr=body.use_mmr,
+            diversity=body.diversity,
+            vectorizer=vec,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=501, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("keywords extraction failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    used_model = keyphrase_backend.loaded_keybert_model_id() or model_id
+    kws: list[dict[str, Any]] = []
+    for phrase, score in pairs:
+        kws.append({"keyword": phrase, "score": float(score)})
+
+    return {"object": "keywords", "model": used_model, "keywords": kws}
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
     return {
@@ -333,6 +439,7 @@ def healthz() -> dict[str, Any]:
         "model": _model_id_loaded or None,
         "loaded": _backend is not None,
         "loader": (_runtime.get("loader") if _runtime else None),
+        "keybert_model": keyphrase_backend.loaded_keybert_model_id() or None,
     }
 
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"ai-search-v1/internal/model/embedding"
+	"ai-search-v1/internal/query"
 	"ai-search-v1/internal/storage/milvus"
 )
 
@@ -34,6 +35,14 @@ func RecallMilvusVector(ctx context.Context, repo *milvus.Repository, vec []floa
 	out := make([]Hit, 0, len(row))
 	for i := range row {
 		m := row[i]
+		title := m.Title
+		if title == "" {
+			title = m.ChunkID
+		}
+		url := m.URL
+		if url == "" {
+			url = m.DocID
+		}
 		out = append(out, Hit{
 			ChunkID:      m.ChunkID,
 			DocID:        m.DocID,
@@ -42,8 +51,11 @@ func RecallMilvusVector(ctx context.Context, repo *milvus.Repository, vec []floa
 			Ts:           m.UpdatedTime,
 			CreatedTs:    m.CreatedTime,
 			Score:        float64(m.Score),
-			URLOrDocID:   m.DocID,
-			Title:        m.ChunkID,
+			URLOrDocID:   url,
+			Title:        title,
+			Offset:       m.Offset,
+			PageNo:       int(m.PageNo),
+			Source:       query.ContentFetchSource(m.URL, url),
 			RecallSource: "milvus",
 		})
 	}

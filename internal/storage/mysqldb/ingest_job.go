@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -69,7 +70,14 @@ func (r *IngestJobRepository) InsertQueued(ctx context.Context, jobID, jobName, 
 INSERT INTO ingest_job (job_id, job_name, status, payload_type, request_id, total_files, pipeline_params, created_at, updated_at)
 VALUES (?, ?, 'queued', ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())
 `, jobID, jobName, payloadType, req, totalFiles, pipelineJSON)
-	return err
+	if err != nil {
+		log.Printf("ingest_job: InsertQueued failed job_id=%s job_name=%s payload_type=%s request_id=%v total_files=%d err=%v",
+			jobID, jobName, payloadType, req, totalFiles, err)
+		return err
+	}
+	log.Printf("ingest_job: created job_id=%s job_name=%s payload_type=%s request_id=%v total_files=%d pipeline_json_bytes=%d",
+		jobID, jobName, payloadType, req, totalFiles, len(pipelineJSON))
+	return nil
 }
 
 // MarkRunning Worker 开始处理。
@@ -77,9 +85,24 @@ func (r *IngestJobRepository) MarkRunning(ctx context.Context, jobID string) err
 	if r == nil || r.db == nil {
 		return nil
 	}
-	_, err := r.db.ExecContext(ctx, `
+	res, err := r.db.ExecContext(ctx, `
 UPDATE ingest_job SET status='running', started_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP() WHERE job_id=?`, jobID)
-	return err
+	if err != nil {
+		log.Printf("ingest_job: MarkRunning failed job_id=%s err=%v", jobID, err)
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("ingest_job: MarkRunning RowsAffected failed job_id=%s err=%v", jobID, err)
+		return err
+	}
+	if n == 0 {
+		err := fmt.Errorf("mysqldb: MarkRunning updated 0 rows (missing ingest_job row for job_id=%q?)", jobID)
+		log.Printf("ingest_job: MarkRunning job_id=%s: %v", jobID, err)
+		return err
+	}
+	log.Printf("ingest_job: status=running job_id=%s rows_affected=%d", jobID, n)
+	return nil
 }
 
 // SetTotalFiles 修正文件总数（如 S3 list 后）。
@@ -92,6 +115,9 @@ func (r *IngestJobRepository) SetTotalFiles(ctx context.Context, jobID string, n
 }
 
 // AddFileOutcome 单文件完成统计。
+// successDocs/failDocs：逻辑上处理的「输入文档」计数（如 NDJSON 行数、整文件算 1）；与 ES task 上 success_docs/fail_docs 一致。
+// chunks：本文件写入 Milvus 的 chunk 行数（RunStats.ChunksWritten，含按 ingest.chunk_* 切分后的多段），不是 doc 数。
+// total_docs：本 job 累计处理的 doc 单位数，等于各次 successDocs+failDocs 之和（完成后与 success_docs+fail_docs 一致）。
 func (r *IngestJobRepository) AddFileOutcome(ctx context.Context, jobID string, fileOK bool, successDocs, failDocs, chunks int64) error {
 	if r == nil || r.db == nil {
 		return nil
@@ -102,15 +128,20 @@ func (r *IngestJobRepository) AddFileOutcome(ctx context.Context, jobID string, 
 	} else {
 		ff = 1
 	}
+	docDelta := successDocs + failDocs
+	if docDelta < 0 {
+		docDelta = 0
+	}
 	_, err := r.db.ExecContext(ctx, `
 UPDATE ingest_job SET
   success_files = success_files + ?,
   fail_files = fail_files + ?,
   success_docs = success_docs + ?,
   fail_docs = fail_docs + ?,
+  total_docs = total_docs + ?,
   total_chunks = total_chunks + ?,
   updated_at = UTC_TIMESTAMP()
-WHERE job_id=?`, sf, ff, successDocs, failDocs, chunks, jobID)
+WHERE job_id=?`, sf, ff, successDocs, failDocs, docDelta, chunks, jobID)
 	return err
 }
 
@@ -127,8 +158,31 @@ func (r *IngestJobRepository) MarkTerminal(ctx context.Context, jobID, status, l
 		}
 		errPtr = le
 	}
-	_, err := r.db.ExecContext(ctx, `
+	res, err := r.db.ExecContext(ctx, `
 UPDATE ingest_job SET status=?, finished_at=UTC_TIMESTAMP(), last_error=?, updated_at=UTC_TIMESTAMP() WHERE job_id=?`,
 		status, errPtr, jobID)
-	return err
+	if err != nil {
+		log.Printf("ingest_job: MarkTerminal failed job_id=%s terminal_status=%s err=%v", jobID, status, err)
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		log.Printf("ingest_job: MarkTerminal RowsAffected failed job_id=%s terminal_status=%s err=%v", jobID, status, err)
+		return err
+	}
+	if n == 0 {
+		err := fmt.Errorf("mysqldb: MarkTerminal updated 0 rows (missing ingest_job row for job_id=%q?)", jobID)
+		log.Printf("ingest_job: MarkTerminal job_id=%s terminal_status=%s: %v", jobID, status, err)
+		return err
+	}
+	if strings.TrimSpace(lastErr) != "" {
+		ex := lastErr
+		if len(ex) > 256 {
+			ex = ex[:256] + "…"
+		}
+		log.Printf("ingest_job: finished job_id=%s status=%s rows_affected=%d last_error_excerpt=%q", jobID, status, n, ex)
+	} else {
+		log.Printf("ingest_job: finished job_id=%s status=%s rows_affected=%d", jobID, status, n)
+	}
+	return nil
 }

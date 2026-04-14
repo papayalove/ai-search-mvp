@@ -15,11 +15,12 @@ import (
 	"ai-search-v1/internal/storage/es"
 	"ai-search-v1/internal/storage/milvus"
 	"ai-search-v1/internal/storage/mysqldb"
+	storages3 "ai-search-v1/internal/storage/s3"
 )
 
 func main() {
 	config.LoadDotEnv()
-	cfgPath := config.ResolveAPIConfigPath(config.DefaultAPIConfigPath)
+	cfgPath := config.DefaultAPIConfigPath
 	apiCfg, err := config.LoadAPI(cfgPath)
 	if err != nil {
 		log.Fatalf("load api config %q: %v", cfgPath, err)
@@ -56,6 +57,14 @@ func main() {
 		log.Printf("ingest queue: redis list %q (multipart payload TTL=%v, remote job meta TTL=%v)", qe.QueueListKey, qe.MultipartPayloadTTL, qe.RemoteJobMetaTTL)
 	} else {
 		log.Print("ingest queue: disabled (set REDIS_INGEST_URL or REDIS_INGEST_HOST and REDIS_INGEST_ENABLED=true)")
+	}
+
+	var contentS3 *storages3.Client
+	if s3c, err := storages3.New(ctx, qe.S3); err != nil {
+		log.Printf("s3 content: client not initialized (s3:// on GET /v1/content unavailable): %v", err)
+	} else {
+		contentS3 = s3c
+		log.Print("s3 content: client ready for GET /v1/content (s3:// sources)")
 	}
 
 	var milvusRepo *milvus.Repository
@@ -122,7 +131,7 @@ func main() {
 		log.Printf("ingest meta: mysql ingest_job enabled (INGEST_ES_TASK_INDEX=%q)", im.TaskESIndex)
 	}
 
-	srv := app.NewHTTPServer(searcher, ingestBroker, qe, chOpts, milvusRepo, ingestMeta)
+	srv := app.NewHTTPServer(searcher, ingestBroker, qe, chOpts, milvusRepo, ingestMeta, contentS3)
 	log.Printf("api listening on %s (config %q)", addr, cfgPath)
 	if err := http.ListenAndServe(addr, srv); err != nil {
 		log.Fatal(err)

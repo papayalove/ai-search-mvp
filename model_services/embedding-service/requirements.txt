@@ -10,3 +10,6 @@ transformers>=4.51.0
 sentence-transformers>=3.0.0
 # transformers 4.5x + sentence-transformers 3.x 在导入链上要求 torch>=2.1；2.0.x 会出现 LRScheduler 等 NameError
 torch>=2.1.0
+# POST /v1/keywords（KeyBERT）
+keybert>=0.8.0
+scikit-learn>=1.3.0

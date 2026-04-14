@@ -9,7 +9,7 @@
 - **启动**（默认端口与 `.env.example` 中 `EMBEDDING_API_BASE_URL` 一致）：
 
 ```bash
-cd python/embedding-service
+cd model_services/embedding-service
 pip install -r requirements.txt
 # 可选：CPU 轮子
 # pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -46,10 +46,11 @@ uvicorn app:app --host 0.0.0.0 --port 3888
 - **模型**：如 Qwen3-Embedding-0.6B（以 HuggingFace 官方说明为准）；依赖版本与官方要求一致。
 - **栈**：`transformers` 或 `sentence-transformers` 二选一；说明 GPU/CPU、`dtype`、模型缓存目录。
 - **服务形态**：FastAPI + Uvicorn；**健康检查** `GET /healthz`（或 `/health`）。
+- **关键词**：`POST /v1/keywords`（KeyBERT + `sentence-transformers`，默认 `KEYBERT_MODEL=all-MiniLM-L6-v2`），与嵌入模型配置独立；鉴权同 `/v1/embeddings`。实现见 [`keyphrase_backend.py`](./keyphrase_backend.py)。
 
 ## 与 Go 对接
 
-- 服务地址通过根目录 **`.env`** 覆盖 yaml，例如 `EMBEDDING_API_BASE_URL`、`EMBEDDING_ENDPOINT`（见 [.env.example](../../.env.example)）。
+- 服务地址通过根目录 **`.env`** 覆盖 yaml，例如 `EMBEDDING_API_BASE_URL`（见 [.env.example](../../.env.example)）。
 - 联调：`cmd/api` / `cmd/importer` 使用 `http` backend 指向本服务。
 
 ## 部署提示

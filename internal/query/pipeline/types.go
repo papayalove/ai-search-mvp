@@ -34,6 +34,11 @@ type SearchHit struct {
 	URLOrDocID string
 	PDFPage     *int
 	Title       string
+	// Offset / PageNo 为入库时记录的 chunk 在 page 内字节起点与页号（Milvus/ES）。
+	Offset int64
+	PageNo int
+	// Source 为可用于 GET /v1/content 的 http(s) 或 s3:// 地址（与 Milvus url 或 url 型 doc 对齐）。
+	Source string
 	// RecallSource 混合检索时：milvus | es | both（仅 Admin 等需要时可透出）。
 	RecallSource string `json:"recall_source,omitempty"`
 }

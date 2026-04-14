@@ -10,6 +10,8 @@ const (
 	defaultMaxJobIDLen     = 128
 	defaultMaxTaskIDLen    = 256
 	defaultMaxExtraInfoLen = 8192
+	defaultMaxTitleLen     = 512
+	defaultMaxURLLen       = 2048
 	defaultShardNum        int32 = 2
 	defaultInsertBatch     = 512
 	defaultHNSWM              = 16
@@ -47,10 +49,13 @@ type Config struct {
 	MaxJobIDLen     int // VarChar job_id，0 用 defaultMaxJobIDLen
 	MaxTaskIDLen    int
 	MaxExtraInfoLen int // extra_info JSON 字符串上限，0 用 defaultMaxExtraInfoLen
+	MaxTitleLen     int // VarChar title，0 用 defaultMaxTitleLen
+	MaxURLLen       int // VarChar url，0 用 defaultMaxURLLen
 }
 
 func (c Config) withDefaults() Config {
-	if strings.TrimSpace(c.Collection) == "" {
+	c.Collection = strings.TrimSpace(c.Collection)
+	if c.Collection == "" {
 		c.Collection = defaultCollectionName
 	}
 	if c.ShardNum <= 0 {

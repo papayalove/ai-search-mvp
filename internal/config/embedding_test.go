@@ -8,7 +8,6 @@ func TestToHTTPEmbedderOptions_EmbeddingSourceSelfHosted(t *testing.T) {
 	t.Setenv("EMBEDDING_SOURCE", "self_hosted")
 	t.Setenv("EMBEDDING_LOCAL_HTTP_HOST", "127.0.0.1")
 	t.Setenv("EMBEDDING_LOCAL_HTTP_PORT", "3999")
-	t.Setenv("EMBEDDING_ENDPOINT", "")
 	t.Setenv("EMBEDDING_API_BASE_URL", "")
 
 	e := EmbeddingConfig{
@@ -28,7 +27,6 @@ func TestToHTTPEmbedderOptions_EmbeddingSourceSelfHosted(t *testing.T) {
 
 func TestToHTTPEmbedderOptions_RemoteBaseURL(t *testing.T) {
 	t.Setenv("EMBEDDING_SOURCE", "remote")
-	t.Setenv("EMBEDDING_ENDPOINT", "")
 	t.Setenv("EMBEDDING_API_BASE_URL", "https://api.example.com")
 
 	e := EmbeddingConfig{TimeoutSeconds: 30, MaxBatch: 8, ExpectedDim: 768}
@@ -41,11 +39,29 @@ func TestToHTTPEmbedderOptions_RemoteBaseURL(t *testing.T) {
 	}
 }
 
+func TestToHTTPEmbedderOptions_RemoteFallsBackToYamlWhenBaseUnset(t *testing.T) {
+	t.Setenv("EMBEDDING_SOURCE", "remote")
+	t.Setenv("EMBEDDING_API_BASE_URL", "")
+
+	e := EmbeddingConfig{
+		Endpoint:       "https://yaml-only.example/v1/embeddings",
+		TimeoutSeconds: 30,
+		MaxBatch:       8,
+		ExpectedDim:    768,
+	}
+	opt, err := e.ToHTTPEmbedderOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://yaml-only.example/v1/embeddings"; opt.Endpoint != want {
+		t.Fatalf("endpoint: got %q want %q", opt.Endpoint, want)
+	}
+}
+
 func TestToHTTPEmbedderOptions_SelfHostedUsesEmbeddingModelIgnoresAPIModel(t *testing.T) {
 	t.Setenv("EMBEDDING_SOURCE", "self_hosted")
 	t.Setenv("EMBEDDING_LOCAL_HTTP_HOST", "127.0.0.1")
 	t.Setenv("EMBEDDING_LOCAL_HTTP_PORT", "3888")
-	t.Setenv("EMBEDDING_ENDPOINT", "")
 	t.Setenv("EMBEDDING_API_BASE_URL", "")
 	t.Setenv("EMBEDDING_API_MODEL", "BAAI/bge-m3")
 	t.Setenv("EMBEDDING_MODEL", `D:\checkpoint\model`)
@@ -64,7 +80,6 @@ func TestToHTTPEmbedderOptions_SelfHostedFallsBackToYamlWhenEmbeddingModelUnset(
 	t.Setenv("EMBEDDING_SOURCE", "self_hosted")
 	t.Setenv("EMBEDDING_LOCAL_HTTP_HOST", "127.0.0.1")
 	t.Setenv("EMBEDDING_LOCAL_HTTP_PORT", "3888")
-	t.Setenv("EMBEDDING_ENDPOINT", "")
 	t.Setenv("EMBEDDING_API_BASE_URL", "")
 	t.Setenv("EMBEDDING_API_MODEL", "api-only")
 	t.Setenv("EMBEDDING_MODEL", "")
@@ -83,7 +98,6 @@ func TestToHTTPEmbedderOptions_SelfHostedUsesOnlyLocalAPIKey(t *testing.T) {
 	t.Setenv("EMBEDDING_SOURCE", "self_hosted")
 	t.Setenv("EMBEDDING_LOCAL_HTTP_HOST", "127.0.0.1")
 	t.Setenv("EMBEDDING_LOCAL_HTTP_PORT", "3888")
-	t.Setenv("EMBEDDING_ENDPOINT", "")
 	t.Setenv("EMBEDDING_API_BASE_URL", "")
 	t.Setenv("EMBEDDING_API_KEY", "remote-secret")
 	t.Setenv("EMBEDDING_LOCAL_API_KEY", "local-secret")

@@ -95,7 +95,43 @@ func (r *Repository) HasCollection(ctx context.Context) (bool, error) {
 }
 
 // EnsureCollection creates the collection (if missing), ensures a vector index, and loads it.
+// 与写入路径共用 lazyWriteMu，避免多 worker 并发时 HasCollection/CreateCollection 竞态导致「未建表却标记已就绪」。
 func (r *Repository) EnsureCollection(ctx context.Context) error {
+	if r == nil || r.c == nil {
+		return fmt.Errorf("milvus: repository not ready")
+	}
+	return r.runEnsureCollection(ctx, false)
+}
+
+func (r *Repository) ensureCollectionForWrite(ctx context.Context) error {
+	if r == nil || r.c == nil {
+		return fmt.Errorf("milvus: repository not ready")
+	}
+	return r.runEnsureCollection(ctx, true)
+}
+
+// skipIfReady 为 true 时，若已成功 ensure 过则直接返回（写入热路径）。
+func (r *Repository) runEnsureCollection(ctx context.Context, skipIfReady bool) error {
+	r.lazyWriteMu.Lock()
+	defer r.lazyWriteMu.Unlock()
+	if skipIfReady && r.lazyWriteEnsured {
+		return nil
+	}
+	if err := r.ensureCollectionBody(ctx); err != nil {
+		r.lazyWriteEnsured = false
+		return err
+	}
+	r.lazyWriteEnsured = true
+	return nil
+}
+
+func (r *Repository) invalidateWriteCache() {
+	r.lazyWriteMu.Lock()
+	r.lazyWriteEnsured = false
+	r.lazyWriteMu.Unlock()
+}
+
+func (r *Repository) ensureCollectionBody(ctx context.Context) error {
 	sch, err := collectionSchema(r.cfg)
 	if err != nil {
 		return err
@@ -105,6 +141,14 @@ func (r *Repository) EnsureCollection(ctx context.Context) error {
 		return fmt.Errorf("has collection: %w", err)
 	}
 	if !has {
+		db := strings.TrimSpace(r.cfg.DBName)
+		if db == "" {
+			db = "(default)"
+		}
+		log.Printf("[ingest] milvus creating collection name=%q db=%q shards=%d", r.cfg.Collection, db, r.cfg.ShardNum)
+		for _, line := range describeSchemaFields(sch) {
+			log.Printf("[ingest] milvus schema field: %s", line)
+		}
 		if err := r.c.CreateCollection(ctx, sch, r.cfg.ShardNum); err != nil {
 			return fmt.Errorf("create collection: %w", err)
 		}
@@ -115,23 +159,49 @@ func (r *Repository) EnsureCollection(ctx context.Context) error {
 	if err := r.c.LoadCollection(ctx, r.cfg.Collection, false); err != nil {
 		return fmt.Errorf("load collection: %w", err)
 	}
-	r.lazyWriteMu.Lock()
-	r.lazyWriteEnsured = true
-	r.lazyWriteMu.Unlock()
 	return nil
 }
 
-func (r *Repository) ensureCollectionForWrite(ctx context.Context) error {
-	if r == nil || r.c == nil {
-		return fmt.Errorf("milvus: repository not ready")
-	}
-	r.lazyWriteMu.Lock()
-	done := r.lazyWriteEnsured
-	r.lazyWriteMu.Unlock()
-	if done {
+// describeSchemaFields 将 CreateCollection 使用的 entity.Schema 字段打成可读行（name、类型、type_params、主键标记）。
+func describeSchemaFields(sch *entity.Schema) []string {
+	if sch == nil || len(sch.Fields) == 0 {
 		return nil
 	}
-	return r.EnsureCollection(ctx)
+	out := make([]string, 0, len(sch.Fields))
+	for _, f := range sch.Fields {
+		parts := []string{f.Name, f.DataType.String()}
+		if f.PrimaryKey {
+			parts = append(parts, "pk")
+		}
+		if f.AutoID {
+			parts = append(parts, "auto_id")
+		}
+		if len(f.TypeParams) > 0 {
+			keys := make([]string, 0, len(f.TypeParams))
+			for k := range f.TypeParams {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				parts = append(parts, k+"="+f.TypeParams[k])
+			}
+		}
+		out = append(out, strings.Join(parts, " "))
+	}
+	return out
+}
+
+func isMilvusCollectionNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "collection not found") ||
+		strings.Contains(s, "collection not exist") ||
+		strings.Contains(s, "can't find collection") ||
+		strings.Contains(s, "cannot find collection") ||
+		strings.Contains(s, "describe collection failed") && strings.Contains(s, "not found") ||
+		strings.Contains(s, "collectionnotfound")
 }
 
 func (r *Repository) ensureVectorIndex(ctx context.Context) error {
@@ -263,12 +333,27 @@ func (r *Repository) writeChunks(ctx context.Context, partition string, rows []C
 			return err
 		}
 		var werr error
-		if upsert {
-			_, werr = r.c.Upsert(ctx, r.cfg.Collection, partition, cols...)
-		} else {
-			_, werr = r.c.Insert(ctx, r.cfg.Collection, partition, cols...)
-		}
-		if werr != nil {
+		for attempt := 0; attempt < 2; attempt++ {
+			if upsert {
+				_, werr = r.c.Upsert(ctx, r.cfg.Collection, partition, cols...)
+			} else {
+				_, werr = r.c.Insert(ctx, r.cfg.Collection, partition, cols...)
+			}
+			if werr == nil {
+				break
+			}
+			if attempt == 0 && isMilvusCollectionNotFoundErr(werr) {
+				log.Printf("[ingest] milvus %s: collection missing (re-ensure) name=%q db=%q err=%v",
+					op, r.cfg.Collection, dbLabel, werr)
+				r.invalidateWriteCache()
+				if err := r.ensureCollectionForWrite(ctx); err != nil {
+					if upsert {
+						return fmt.Errorf("milvus upsert: %w (re-ensure failed: %v)", werr, err)
+					}
+					return fmt.Errorf("milvus insert: %w (re-ensure failed: %v)", werr, err)
+				}
+				continue
+			}
 			if upsert {
 				return fmt.Errorf("milvus upsert: %w", werr)
 			}
@@ -328,6 +413,20 @@ func validateChunkEntities(rows []ChunkEntity, cfg Config) error {
 		if len(row.ExtraInfoJSON) > maxE {
 			return fmt.Errorf("row %d: extra_info longer than %d", i, maxE)
 		}
+		maxTi := cfg.MaxTitleLen
+		if maxTi <= 0 {
+			maxTi = defaultMaxTitleLen
+		}
+		if len(row.Title) > maxTi {
+			return fmt.Errorf("row %d: title longer than %d", i, maxTi)
+		}
+		maxU := cfg.MaxURLLen
+		if maxU <= 0 {
+			maxU = defaultMaxURLLen
+		}
+		if len(row.URL) > maxU {
+			return fmt.Errorf("row %d: url longer than %d", i, maxU)
+		}
 	}
 	return nil
 }
@@ -343,6 +442,8 @@ func chunkColumns(rows []ChunkEntity, dim int) ([]entity.Column, error) {
 	n := len(rows)
 	ids := make([]string, n)
 	docs := make([]string, n)
+	titles := make([]string, n)
+	urls := make([]string, n)
 	vecs := make([][]float32, n)
 	src := make([]string, n)
 	langs := make([]string, n)
@@ -351,9 +452,13 @@ func chunkColumns(rows []ChunkEntity, dim int) ([]entity.Column, error) {
 	extras := make([]string, n)
 	created := make([]int64, n)
 	updated := make([]int64, n)
+	offsets := make([]int64, n)
+	pageNos := make([]int64, n)
 	for i := range rows {
 		ids[i] = strings.TrimSpace(rows[i].ChunkID)
 		docs[i] = strings.TrimSpace(rows[i].DocID)
+		titles[i] = strings.TrimSpace(rows[i].Title)
+		urls[i] = strings.TrimSpace(rows[i].URL)
 		v := rows[i].Embedding
 		cp := make([]float32, len(v))
 		copy(cp, v)
@@ -369,11 +474,17 @@ func chunkColumns(rows []ChunkEntity, dim int) ([]entity.Column, error) {
 		extras[i] = ex
 		created[i] = rows[i].CreatedTime
 		updated[i] = rows[i].UpdatedTime
+		offsets[i] = rows[i].Offset
+		pageNos[i] = rows[i].PageNo
 	}
 	return []entity.Column{
 		entity.NewColumnVarChar(FieldChunkID, ids),
 		entity.NewColumnVarChar(FieldDocID, docs),
+		entity.NewColumnVarChar(FieldTitle, titles),
+		entity.NewColumnVarChar(FieldURL, urls),
 		entity.NewColumnFloatVector(FieldEmbedding, dim, vecs),
+		entity.NewColumnInt64(FieldOffset, offsets),
+		entity.NewColumnInt64(FieldPageNo, pageNos),
 		entity.NewColumnVarChar(FieldSourceType, src),
 		entity.NewColumnVarChar(FieldLang, langs),
 		entity.NewColumnVarChar(FieldJobID, jobs),
@@ -425,7 +536,7 @@ func (r *Repository) SearchVectors(ctx context.Context, p VectorSearchParams) ([
 	if err != nil {
 		return nil, err
 	}
-	out := []string{FieldChunkID, FieldDocID, FieldSourceType, FieldLang, FieldJobID, FieldTaskID, FieldCreatedTime, FieldUpdatedTime}
+	out := []string{FieldChunkID, FieldDocID, FieldTitle, FieldURL, FieldSourceType, FieldLang, FieldJobID, FieldTaskID, FieldCreatedTime, FieldUpdatedTime, FieldOffset, FieldPageNo}
 	raw, err := r.c.Search(ctx, r.cfg.Collection, p.Partitions, p.Expr, out, vecs, FieldEmbedding, entity.COSINE, p.TopK, sp)
 	if err != nil {
 		return nil, fmt.Errorf("milvus search: %w", err)
@@ -441,12 +552,16 @@ func (r *Repository) SearchVectors(ctx context.Context, p VectorSearchParams) ([
 			continue
 		}
 		docCol := sr.Fields.GetColumn(FieldDocID)
+		titleCol := sr.Fields.GetColumn(FieldTitle)
+		urlCol := sr.Fields.GetColumn(FieldURL)
 		stCol := sr.Fields.GetColumn(FieldSourceType)
 		langCol := sr.Fields.GetColumn(FieldLang)
 		jobCol := sr.Fields.GetColumn(FieldJobID)
 		taskCol := sr.Fields.GetColumn(FieldTaskID)
 		ctCol := sr.Fields.GetColumn(FieldCreatedTime)
 		utCol := sr.Fields.GetColumn(FieldUpdatedTime)
+		offCol := sr.Fields.GetColumn(FieldOffset)
+		pnCol := sr.Fields.GetColumn(FieldPageNo)
 		row := make([]VectorMatch, 0, sr.ResultCount)
 		for j := 0; j < sr.ResultCount; j++ {
 			id, err := sr.IDs.GetAsString(j)
@@ -460,6 +575,8 @@ func (r *Repository) SearchVectors(ctx context.Context, p VectorSearchParams) ([
 			row = append(row, VectorMatch{
 				ChunkID:     id,
 				DocID:       strAt(docCol, j),
+				Title:       strAt(titleCol, j),
+				URL:         strAt(urlCol, j),
 				Score:       score,
 				SourceType:  strAt(stCol, j),
 				Lang:        strAt(langCol, j),
@@ -467,6 +584,8 @@ func (r *Repository) SearchVectors(ctx context.Context, p VectorSearchParams) ([
 				TaskID:      strAt(taskCol, j),
 				CreatedTime: int64At(ctCol, j),
 				UpdatedTime: int64At(utCol, j),
+				Offset:      int64At(offCol, j),
+				PageNo:      int64At(pnCol, j),
 			})
 		}
 		res = append(res, row)
@@ -480,7 +599,7 @@ func (r *Repository) QueryByChunkIDs(ctx context.Context, chunkIDs []string, out
 		return nil, nil
 	}
 	if len(outputFields) == 0 {
-		outputFields = []string{FieldChunkID, FieldDocID, FieldSourceType, FieldLang, FieldJobID, FieldTaskID, FieldExtraInfo, FieldCreatedTime, FieldUpdatedTime}
+		outputFields = []string{FieldChunkID, FieldDocID, FieldTitle, FieldURL, FieldSourceType, FieldLang, FieldJobID, FieldTaskID, FieldExtraInfo, FieldCreatedTime, FieldUpdatedTime, FieldOffset, FieldPageNo}
 	}
 	col := entity.NewColumnVarChar(FieldChunkID, chunkIDs)
 	rs, err := r.c.QueryByPks(ctx, r.cfg.Collection, nil, col, outputFields)
@@ -492,6 +611,8 @@ func (r *Repository) QueryByChunkIDs(ctx context.Context, chunkIDs []string, out
 	}
 	idCol := rs.GetColumn(FieldChunkID)
 	docCol := rs.GetColumn(FieldDocID)
+	titleCol := rs.GetColumn(FieldTitle)
+	urlCol := rs.GetColumn(FieldURL)
 	stCol := rs.GetColumn(FieldSourceType)
 	langCol := rs.GetColumn(FieldLang)
 	jobCol := rs.GetColumn(FieldJobID)
@@ -499,12 +620,16 @@ func (r *Repository) QueryByChunkIDs(ctx context.Context, chunkIDs []string, out
 	exCol := rs.GetColumn(FieldExtraInfo)
 	ctCol := rs.GetColumn(FieldCreatedTime)
 	utCol := rs.GetColumn(FieldUpdatedTime)
+	offCol := rs.GetColumn(FieldOffset)
+	pnCol := rs.GetColumn(FieldPageNo)
 	embCol := rs.GetColumn(FieldEmbedding)
 	out := make([]ChunkRecord, rs.Len())
 	for i := 0; i < rs.Len(); i++ {
 		rec := ChunkRecord{
 			ChunkID:       strAt(idCol, i),
 			DocID:         strAt(docCol, i),
+			Title:         strAt(titleCol, i),
+			URL:           strAt(urlCol, i),
 			SourceType:    strAt(stCol, i),
 			Lang:          strAt(langCol, i),
 			JobID:         strAt(jobCol, i),
@@ -512,6 +637,8 @@ func (r *Repository) QueryByChunkIDs(ctx context.Context, chunkIDs []string, out
 			ExtraInfoJSON: strAt(exCol, i),
 			CreatedTime:   int64At(ctCol, i),
 			UpdatedTime:   int64At(utCol, i),
+			Offset:        int64At(offCol, i),
+			PageNo:        int64At(pnCol, i),
 		}
 		if embCol != nil {
 			v, err := embCol.Get(i)
@@ -535,7 +662,7 @@ func (r *Repository) QueryByExpr(ctx context.Context, expr string, limit int64, 
 	if strings.TrimSpace(expr) == "" {
 		expr = `chunk_id != ""`
 	}
-	outFields := []string{FieldChunkID, FieldDocID, FieldSourceType, FieldLang, FieldJobID, FieldTaskID, FieldExtraInfo, FieldCreatedTime, FieldUpdatedTime}
+	outFields := []string{FieldChunkID, FieldDocID, FieldTitle, FieldURL, FieldSourceType, FieldLang, FieldJobID, FieldTaskID, FieldExtraInfo, FieldCreatedTime, FieldUpdatedTime, FieldOffset, FieldPageNo}
 	if withVector {
 		outFields = append(outFields, FieldEmbedding)
 	}
@@ -548,6 +675,8 @@ func (r *Repository) QueryByExpr(ctx context.Context, expr string, limit int64, 
 	}
 	idCol := rs.GetColumn(FieldChunkID)
 	docCol := rs.GetColumn(FieldDocID)
+	titleCol := rs.GetColumn(FieldTitle)
+	urlCol := rs.GetColumn(FieldURL)
 	stCol := rs.GetColumn(FieldSourceType)
 	langCol := rs.GetColumn(FieldLang)
 	jobCol := rs.GetColumn(FieldJobID)
@@ -555,12 +684,16 @@ func (r *Repository) QueryByExpr(ctx context.Context, expr string, limit int64, 
 	exCol := rs.GetColumn(FieldExtraInfo)
 	ctCol := rs.GetColumn(FieldCreatedTime)
 	utCol := rs.GetColumn(FieldUpdatedTime)
+	offCol := rs.GetColumn(FieldOffset)
+	pnCol := rs.GetColumn(FieldPageNo)
 	embCol := rs.GetColumn(FieldEmbedding)
 	out := make([]ChunkRecord, rs.Len())
 	for i := 0; i < rs.Len(); i++ {
 		rec := ChunkRecord{
 			ChunkID:       strAt(idCol, i),
 			DocID:         strAt(docCol, i),
+			Title:         strAt(titleCol, i),
+			URL:           strAt(urlCol, i),
 			SourceType:    strAt(stCol, i),
 			Lang:          strAt(langCol, i),
 			JobID:         strAt(jobCol, i),
@@ -568,6 +701,8 @@ func (r *Repository) QueryByExpr(ctx context.Context, expr string, limit int64, 
 			ExtraInfoJSON: strAt(exCol, i),
 			CreatedTime:   int64At(ctCol, i),
 			UpdatedTime:   int64At(utCol, i),
+			Offset:        int64At(offCol, i),
+			PageNo:        int64At(pnCol, i),
 		}
 		if embCol != nil {
 			v, err := embCol.Get(i)

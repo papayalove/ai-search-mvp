@@ -13,5 +13,8 @@ type Hit struct {
 	URLOrDocID   string
 	PDFPage      *int
 	Title        string
+	Offset       int64
+	PageNo       int
+	Source       string
 	RecallSource string // milvus | es | both
 }

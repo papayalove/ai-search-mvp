@@ -16,21 +16,22 @@ type Client struct {
 	api *awss3.Client
 }
 
-// New 使用默认凭证链；cfg.Endpoint 非空时使用 custom endpoint（path-style 兼容 MinIO）。
+// New 使用默认凭证链；cfg.Endpoint 非空时设 BaseEndpoint；cfg.UsePathStyle 为 path 式寻址（addressing_style=path，兼容 MinIO/部分 OBS）。
 func New(ctx context.Context, cfg Config) (*Client, error) {
-	opts := []func(*config.LoadOptions) error{}
-	if cfg.Region != "" {
-		opts = append(opts, config.WithRegion(cfg.Region))
+	opts := []func(*config.LoadOptions) error{
+		config.WithRegion(EffectiveRegion(cfg)),
 	}
 	awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("s3 aws config: %w", err)
 	}
 	s3opts := []func(*awss3.Options){}
-	if cfg.Endpoint != "" {
+	if ep := strings.TrimSpace(cfg.Endpoint); ep != "" || cfg.UsePathStyle {
 		s3opts = append(s3opts, func(o *awss3.Options) {
-			o.BaseEndpoint = aws.String(cfg.Endpoint)
-			o.UsePathStyle = true
+			if ep != "" {
+				o.BaseEndpoint = aws.String(ep)
+			}
+			o.UsePathStyle = cfg.UsePathStyle
 		})
 	}
 	return &Client{api: awss3.NewFromConfig(awsCfg, s3opts...)}, nil
@@ -54,6 +55,44 @@ func (c *Client) GetObjectBody(ctx context.Context, bucket, key string) (io.Read
 		return nil, err
 	}
 	return out.Body, nil
+}
+
+// GetObjectRange 按字节区间读取对象（含 Range: bytes=start-end）；maxBytes 上限 4MiB。
+func (c *Client) GetObjectRange(ctx context.Context, bucket, key string, startByte, maxBytes int64) ([]byte, error) {
+	if c == nil || c.api == nil {
+		return nil, fmt.Errorf("s3: nil client")
+	}
+	bucket = strings.TrimSpace(bucket)
+	key = strings.TrimSpace(key)
+	if bucket == "" || key == "" {
+		return nil, fmt.Errorf("s3: empty bucket or key")
+	}
+	if startByte < 0 {
+		startByte = 0
+	}
+	const hardMax = 4 << 20
+	if maxBytes <= 0 || maxBytes > hardMax {
+		maxBytes = hardMax
+	}
+	end := startByte + maxBytes - 1
+	rng := fmt.Sprintf("bytes=%d-%d", startByte, end)
+	out, err := c.api.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(rng),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(out.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return data[:maxBytes], nil
+	}
+	return data, nil
 }
 
 // HeadObject 是否存在及 ContentLength。

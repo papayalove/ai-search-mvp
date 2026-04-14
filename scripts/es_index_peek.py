@@ -11,7 +11,6 @@
   python scripts/es_index_peek.py --index other_index
 
 环境变量（可选，覆盖 yaml，与 internal/config/api.go ToElasticsearch 对齐）:
-  API_CONFIG          配置文件路径
   ES_URL              单节点地址，覆盖 yaml 中的 address
   ES_ADDRESSES        逗号分隔，取第一个作为 base
   ES_USERNAME, ES_PASSWORD, ES_INDEX
@@ -134,7 +133,7 @@ def es_request(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ES index 文档数与前 3 条数据")
-    parser.add_argument("--config", default="", help="api.yaml 路径（默认 API_CONFIG 或 configs/api.yaml）")
+    parser.add_argument("--config", default="", help="api.yaml 路径（默认 configs/api.yaml）")
     parser.add_argument("--index", default="", help="覆盖索引名（默认 yaml / ES_INDEX）")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP 超时秒数")
     args = parser.parse_args()
@@ -142,7 +141,7 @@ def main() -> None:
     root = repo_root()
     apply_dotenv(root / ".env")
 
-    cfg_rel = args.config.strip() or os.environ.get("API_CONFIG", "").strip() or "configs/api.yaml"
+    cfg_rel = args.config.strip() or "configs/api.yaml"
     config_path = Path(cfg_rel)
     if not config_path.is_absolute():
         config_path = root / config_path
